@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DHT Search</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="demo-banner" hidden>DEMO MODE — synthetic data generated locally, not from the BitTorrent network.</div>
+
+<header class="top">
+  <a class="brand" href="/"><span class="logo" aria-hidden="true"></span>DHT&nbsp;Search</a>
+  <span class="ver" id="app-version" title="Running version"></span>
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="tab-search" data-tab="search" aria-selected="true">Search</button>
+    <button role="tab" id="tab-stats" data-tab="stats" aria-selected="false">Analytics</button>
+    <button role="tab" id="tab-admin" data-tab="admin" aria-selected="false" hidden>Admin</button>
+  </nav>
+  <div class="top-right">
+    <span class="pill" id="pill-live" title="Crawler status"><i class="dot"></i><span id="pill-text">…</span></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  </div>
+</header>
+
+<main>
+  <!-- ============ SEARCH ============ -->
+  <section id="view-search" class="view">
+    <div class="hero" id="hero">
+      <h1>Search the DHT</h1>
+      <p class="sub" id="hero-sub">Torrents discovered by the crawler, with magnet links, seeders, peers and files.</p>
+    </div>
+    <form class="searchbar" id="search-form" role="search" autocomplete="off">
+      <div class="qwrap">
+        <input id="q" type="search" placeholder='Search torrents and files…   "phrase", -exclude, ext:mkv, size>1gb' aria-label="Search" autofocus>
+        <div id="ac" class="ac" hidden></div>
+      </div>
+      <button type="submit">Search</button>
+    </form>
+    <div class="advbar">
+      <button type="button" class="linkbtn" id="adv-toggle">Advanced options ▾</button>
+      <button type="button" class="linkbtn" id="help-toggle">Search syntax</button>
+    </div>
+    <div id="helpwrap"></div>
+    <div id="advwrap" hidden><div id="adv" class="adv"></div></div>
+    <div id="summary"></div>
+    <div id="facets" class="facets"></div>
+    <div id="results" aria-live="polite"></div>
+    <div class="pager" id="pager"></div>
+  </section>
+
+  <!-- ============ ANALYTICS ============ -->
+  <section id="view-stats" class="view" hidden>
+    <h2 class="stats-title">Crawler analytics</h2>
+    <div class="stats-head">
+      <div class="ctrls">
+        <div class="range" role="group" aria-label="Time range">
+          <button data-r="900">15 min</button>
+          <button data-r="3600">1 h</button>
+          <button data-r="21600">6 h</button>
+          <button data-r="86400">24 h</button>
+          <button data-r="604800">7 d</button>
+          <button data-r="2592000">30 d</button>
+          <button data-r="7776000">90 d</button>
+          <button data-r="31536000">1 year</button>
+        </div>
+        <label class="switch" title="When off, data stays frozen until you click &quot;Refresh now&quot;">
+          <input type="checkbox" id="auto-on"><span>Auto refresh</span>
+        </label>
+        <select id="auto-every" aria-label="Refresh interval">
+          <option value="5">every 5 s</option><option value="10">every 10 s</option>
+          <option value="30">every 30 s</option><option value="60">every 1 min</option>
+        </select>
+        <button type="button" class="btn-s" id="refresh-now">Refresh now</button>
+        <span class="meta" id="updated"></span>
+      </div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="grid" id="charts"></div>
+  </section>
+
+  <!-- ============ ADMIN (Ctrl+Alt+A) — built by admin.js ============ -->
+  <section id="view-admin" class="view" hidden></section>
+</main>
+
+<div id="tip" class="tip" hidden></div>
+<script src="/static/common.js"></script>
+<script src="/static/app.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

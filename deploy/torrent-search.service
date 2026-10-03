@@ -1,0 +1,37 @@
+[Unit]
+Description=DHT Search (DHT crawler + web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=torrentsearch
+Group=torrentsearch
+WorkingDirectory=/opt/torrentcrawler
+# Adjust --host/--port/--dht-port as needed. 127.0.0.1 = local only (recommended behind a reverse proxy).
+ExecStart=/opt/torrentcrawler/venv/bin/python app.py --host 127.0.0.1 --port 8080 --dht-port 6881 --data-dir /opt/torrentcrawler/data
+# Admin panel password (Ctrl+Alt+A). Better in a drop-in with 600 permissions:
+#   systemctl edit torrent-search  ->  [Service]  Environment=TS_ADMIN_PASSWORD=something-long
+# Environment=TS_ADMIN_PASSWORD=change-me
+Restart=on-failure
+RestartSec=5
+# On stop, app.py flushes the JSON files (SIGTERM -> atexit); give it time.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+# Memory: fewer malloc arenas (many threads: Flask + libtorrent). Without this glibc creates up to 8×cores arenas
+# and RSS grows by hundreds of MB without the program holding more data.
+Environment=MALLOC_ARENA_MAX=2
+# Many sockets/peers at once
+LimitNOFILE=65536
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/torrentcrawler/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
