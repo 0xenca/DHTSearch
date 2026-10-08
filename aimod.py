@@ -205,6 +205,13 @@ class AIModerator:
 
     def validated(self, changes):
         """The current config with these changes applied and checked (not saved). Raises ValueError."""
+        c, problem = self.check(changes)
+        if problem:
+            raise ValueError(problem)
+        return c
+
+    def check(self, changes):
+        """Like validated(), without raising: (config, None) or (None, message for the admin)."""
         c = dict(self.cfg)
         for k, v in changes.items():
             if k not in DEFAULTS or k == "start_doc":
@@ -218,19 +225,19 @@ class AIModerator:
         c["api"] = c.get("api") if c.get("api") in APIS else "auto"
         c["endpoint"] = re.sub(r"/v1(/chat)?(/completions)?/?$", "", str(c["endpoint"]).strip().rstrip("/"))
         if not re.match(r"^https?://[^\s/]+", c["endpoint"]):
-            raise ValueError("the endpoint must be an http(s):// URL")
+            return None, "the endpoint must be an http(s):// URL"
         for k, lo, hi, typ in (("threshold", 1, 100, int), ("files", 0, 20, int), ("max_rate", 0.05, 50, float),
                                ("timeout", 10, 3600, int), ("controversial_weight", 0, 1, float)):
             try:
                 c[k] = min(max(typ(c[k]), lo), hi)
             except (TypeError, ValueError):
-                raise ValueError(f"invalid {k}")
+                return None, f"invalid {k}"
         c["act_on"] = [k for k in CAT_KEYS if k in set(c.get("act_on") or [])]
         if not c["act_on"]:
-            raise ValueError("select at least one category")
+            return None, "select at least one category"
         c["model"] = str(c["model"])[:200]
         c["api_key"] = str(c["api_key"])[:500]
-        return c
+        return c, None
 
     def update(self, changes):
         """Validates and saves config changes. Returns the new public config. Raises ValueError."""
