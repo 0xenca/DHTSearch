@@ -50,7 +50,9 @@ def init(app, get_store, password, data_dir, get_crawler=None, get_ai=None):
     _CFG["get_crawler"] = get_crawler or (lambda: None)
     _CFG["get_ai"] = get_ai or (lambda: None)
     _CFG["pwd"] = password
-    _CFG["pwd_tag"] = hashlib.sha256(b"ts-admin:" + password.encode()).hexdigest()[:16]
+    # The tag rides in the (signed, not encrypted) session cookie, so derive it with a
+    # slow KDF salted by the server secret: it can't be brute-forced back to the password.
+    _CFG["pwd_tag"] = hashlib.pbkdf2_hmac("sha256", password.encode(), b"ts-admin:" + key, 200_000).hex()[:16]
     app.register_blueprint(bp)
 
 
