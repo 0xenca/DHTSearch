@@ -40,32 +40,40 @@ class RuleError(ValueError):
     pass
 
 
-def validate(term, scope, mode):
+def check(term, scope, mode):
+    """Validates a rule without raising: (clean term, None) or (None, message for the admin)."""
     term = (term or "").strip()
     if not term:
-        raise RuleError("Enter a word or some text")
+        return None, "Enter a word or some text"
     if len(term) > MAX_TERM:
-        raise RuleError(f"At most {MAX_TERM} characters")
+        return None, f"At most {MAX_TERM} characters"
     if scope not in SCOPES:
-        raise RuleError("Invalid scope")
+        return None, "Invalid scope"
     if mode not in MODES:
-        raise RuleError("Invalid mode")
+        return None, "Invalid mode"
     if mode == "word" and not tokenize(term):
-        raise RuleError("The term has no letters or digits: use the \"contains\" mode or a regular expression")
+        return None, "The term has no letters or digits: use the \"contains\" mode or a regular expression"
     if mode == "substring" and not norm(term).strip():
-        raise RuleError("Empty term")
+        return None, "Empty term"
     if mode == "regex":
         try:
             rx = regex.compile(term, regex.I)
-        except regex.error as e:
-            raise RuleError(f"Invalid regular expression: {e}")
+        except regex.error:
+            return None, "Invalid regular expression (check brackets, parentheses, escapes and quantifiers)"
         if rx.search(""):
-            raise RuleError("The regular expression matches the empty text (it would hide everything)")
+            return None, "The regular expression matches the empty text (it would hide everything)"
         try:
             for probe in _RX_PROBES:
                 rx.search(probe, timeout=RX_PROBE_TIMEOUT)
         except TimeoutError:
-            raise RuleError("The regular expression is too slow (catastrophic backtracking): simplify it")
+            return None, "The regular expression is too slow (catastrophic backtracking): simplify it"
+    return term, None
+
+
+def validate(term, scope, mode):
+    term, problem = check(term, scope, mode)
+    if problem:
+        raise RuleError(problem)
     return term
 
 
@@ -205,19 +213,28 @@ class RuleBook:
         return None
 
     def add(self, term, scope="all", mode="word", note=""):
-        term = validate(term, scope, mode)
+        rule, problem = self.try_add(term, scope, mode, note)
+        if problem:
+            raise RuleError(problem)
+        return rule
+
+    def try_add(self, term, scope="all", mode="word", note=""):
+        """Like add(), without raising: (rule, None) or (None, message for the admin)."""
+        term, problem = check(term, scope, mode)
+        if problem:
+            return None, problem
         with self.lock:
             if len(self.rules) >= MAX_RULES:
-                raise RuleError(f"At most {MAX_RULES} rules")
+                return None, f"At most {MAX_RULES} rules"
             for r in self.rules:
                 if r["term"] == term and r["scope"] == scope and r["mode"] == mode:
-                    raise RuleError("An identical rule already exists")
+                    return None, "An identical rule already exists"
             rule = {"id": uuid.uuid4().hex[:10], "term": term, "scope": scope, "mode": mode, "enabled": True,
                     "created": int(time.time()), "note": (note or "")[:200]}
             self.rules.append(rule)
             self.matchers = self._compile()
             self._save()
-            return dict(rule)
+            return dict(rule), None
 
     def update(self, rid, **changes):
         with self.lock:
