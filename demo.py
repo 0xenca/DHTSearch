@@ -10,7 +10,6 @@ import random
 import threading
 import time
 
-from records import apply_health
 
 BASES = [
     ("Debian {v} amd64 netinst", ["debian-{v}-amd64-netinst.iso"], 650),
@@ -151,15 +150,13 @@ class DemoCrawler(threading.Thread):
             "comment": "synthetic torrent (demo mode)", "created_by": "demo",
             "trackers": ["udp://tracker.opentrackr.org:1337/announce", "udp://open.tracker.cl:1337/announce"],
         })
-        rec = st.torrents.get(ih)
-        if rec:
+        if ih in st.torrents:
             n = 6 if dead else rng.choice([0, 0, 1, 3, 6, 10])   # earlier measurements (for the health chart)
             nrep = 3 if dead else rng.choice([1, 2, 3, 4])
             for k in range(n):
                 ts = int(now - (n - k) * 21600 - rng.randint(0, 900))
                 s_k = 0 if dead else max(0, int(seeds * rng.uniform(0.5, 1.5)))
-                apply_health(rec, s_k, int(s_k * 0.6), ts, "scrape", nrep)
-                st.journal.append({"t": "h", "ih": ih, "s": s_k, "p": int(s_k * 0.6), "a": ts, "g": "scrape", "n": nrep})
+                st.update_health(ih, s_k, int(s_k * 0.6), "scrape", nrep, at=ts)
             src = "scrape" if (dead or rng.random() < 0.8) else "swarm"
             d = self._detail(seeds, peers, src, now)
             if src != "scrape":                  # without a tracker, all there is is what was connected

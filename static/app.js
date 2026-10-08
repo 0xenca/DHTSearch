@@ -242,7 +242,7 @@ function resultCard(r) {
       h("span", { title: fmtDateTime(r.indexed_at) }, "Indexed ", fmtRel(r.indexed_at))),
     sourcesLine(r.hd),
     (r.matched_files || []).length ? h("div", { class: "mfiles" }, h("span", null, "Matches in files:"),
-      r.matched_files.map(m => h("div", { class: "mf", title: m.path }, hlNodes(m.hl), h("i", null, fmtBytes(m.size))))) : null,
+      r.matched_files.map(m => h("div", { class: "mf", title: m.path }, h("span", null, hlNodes(m.hl)), h("i", null, fmtBytes(m.size))))) : null,
     r.top_files ? h("p", { class: "top-files" }, r.top_files.join("  ·  ") + (r.file_count > 3 ? "  …" : "")) : null,
     h("div", { class: "actions" },
       h("a", { class: "btn-s primary", href: r.magnet, title: "Open in your BitTorrent client" }, "🧲 Magnet"), copy,
@@ -376,6 +376,16 @@ function setPill(cls, text) { const p = $("#pill-live"); p.className = "pill " +
 function kpi(label, value, sub) {
   return h("div", { class: "kpi" }, h("div", { class: "l" }, label), h("div", { class: "v" }, value), h("div", { class: "s" }, sub || " "));
 }
+function memKpi(m) {
+  // "program" = what the process itself holds; the cgroup figure (systemd, Proxmox LXC, Docker) also counts the kernel's
+  // page cache of the files it read, which the kernel frees as soon as something else needs the memory
+  if (!m || m.rss_mb == null) return kpi("Process memory", "—", "not available on this system");
+  const mb = x => fmtBytes((x || 0) * 1048576);
+  const cg = m.cgroup;
+  const sub = `program ${mb(m.rss_anon_mb)} · peak ${mb(m.peak_rss_mb)}` +
+    (cg && cg.total_mb != null ? ` · systemd/container shows ${mb(cg.total_mb)} (${mb(cg.page_cache_mb)} = file cache, freed when needed)` : "");
+  return kpi("Process memory (RSS)", mb(m.rss_mb), sub);
+}
 const st_of = (a, k) => ((a.health_states || []).find(x => x.name === k) || {}).count || 0;
 function renderKpis(st, hist) {
   const a = st.analytics, lv = st.live || {}, cn = a.counters || {}, life = a.life || {};
@@ -385,17 +395,19 @@ function renderKpis(st, hist) {
   const vpct = a.torrents ? Math.round(a.health_verified / a.torrents * 100) : 0;
   $("#kpis").replaceChildren(
     kpi("Torrents indexed", fmtNum(a.torrents), `${fmtNum(a.torrents / days)} per day on average since the start`),
-    kpi("Files found", fmtNum(a.files)),
+    kpi("Files found", fmtNum(a.files), a.file_index ? (a.file_index.backlog
+        ? `file-name index: ${fmtNum(a.file_index.backlog)} torrents still to index`
+        : `file-name index on disk: ${fmtBytes(a.file_index.bytes)}`) : ""),
     kpi("Size indexed", fmtBytes(a.bytes_indexed), "sum of all torrents"),
     kpi("Infohashes discovered", fmtNum(a.hashes_discovered), `${fmtNum(a.hashes_pending)} queued · ${fmtNum(a.hashes_retry)} to retry · ${fmtNum(a.hashes_dropped)} dropped as stale · ${fmtNum(a.hashes_failed)} without metadata`),
     kpi("DHT nodes (routing table)", fmtNum(lv.dht_nodes), `≈ ${fmtNum(a.nodes_seen)} unique nodes seen in total (all-time)`),
     kpi("Connected peers", fmtNum(lv.peers_connected), `${fmtNum((lv.peers_connected || 0) + (lv.peers_half_open || 0))} connections (${fmtNum(lv.peers_half_open)} half-open) · ≈ ${fmtNum(a.peers_seen)} unique peers (all-time)`),
     kpi("Metadata downloads", fmtNum(lv.active_probes), `${fmtNum(lv.refresh_probes || 0)} refreshing health · ${success}`),
-    kpi("Total traffic ↓", fmtBytes(life.rx_bytes), `now ${fmtRate(lv.rx_bps)} · cumulative over all sessions`),
-    kpi("Total traffic ↑", fmtBytes(life.tx_bytes), `now ${fmtRate(lv.tx_bps)} · cumulative over all sessions`),
+    kpi("Total traffic ↓ / ↑", `${fmtBytes(life.rx_bytes)}`, `↑ ${fmtBytes(life.tx_bytes)} · now ↓ ${fmtRate(lv.rx_bps)} ↑ ${fmtRate(lv.tx_bps)} · all sessions`),
     kpi("BEP 51 (DHT sampling)", lv.sampling === false ? "off" : fmtNum(cn.bep51_replies),
       lv.sampling === false ? "disabled (passive only)" : `replies to ${fmtNum(cn.bep51_queries)} queries (cumulative)`),
     kpi("Alive torrents", fmtNum(st_of(a, "alive")), `${fmtNum(st_of(a, "weak"))} weak · ${fmtNum(st_of(a, "quiet"))} no activity · ${fmtNum(st_of(a, "dead"))} dead · ${fmtNum(st_of(a, "unknown"))} not measured · ${vpct} % verified`),
+    memKpi(st.memory),
     kpi("Total uptime", fmtDur(life.uptime_total || 0), `${fmtNum(life.sessions)} session${life.sessions === 1 ? "" : "s"} · since ${fmtDate(life.first_start)} · this session: ${fmtDur(life.session_uptime || 0)}`));
 }
 

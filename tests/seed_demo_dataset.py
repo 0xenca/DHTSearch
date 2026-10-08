@@ -3,7 +3,6 @@ import hashlib, math, os, random, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import stats as S
 from demo import _fake, PEER_POOL, PEER_REGULARS, CLIENTS
-from records import apply_health
 from store import Store
 
 def seed(d, n=3000, days=40, seed_=11):
@@ -21,14 +20,14 @@ def seed(d, n=3000, days=40, seed_=11):
                              "created": int(ts - rng.randint(0, 86400 * 900)), "comment": "synthetic torrent (demo mode)", "created_by": "demo",
                              "trackers": ["udp://tracker.opentrackr.org:1337/announce"]})
         rec = st.torrents[ih]
-        rec["indexed_at"] = rec["first_seen"] = int(ts)
+        rec["indexed_at"] = int(ts)                      # first_seen (on disk) comes from st.hashes above
         dead = rng.random() < 0.08
         seeds = 0 if dead else int(rng.lognormvariate(2.5, 1.5)); k = 6 if dead else rng.choice([0, 1, 3, 6, 10]); nrep = 3 if dead else rng.choice([1, 2, 3, 4])
         for j in range(k):
             at = int(now - (k - j) * 21600 - rng.randint(0, 900))
-            sj = 0 if dead else max(0, int(seeds * rng.uniform(0.5, 1.5))); apply_health(rec, sj, int(sj * 0.6), at, "scrape", nrep)
+            sj = 0 if dead else max(0, int(seeds * rng.uniform(0.5, 1.5))); st.update_health(ih, sj, int(sj * 0.6), "scrape", nrep, at=at)
         src = "scrape" if (dead or rng.random() < 0.8) else "swarm"
-        apply_health(rec, seeds, int(seeds * .6), now - rng.randint(0, 20000), src, nrep if src == "scrape" else 0)
+        st.update_health(ih, seeds, int(seeds * .6), src, nrep if src == "scrape" else 0, at=now - rng.randint(0, 20000))
         if not dead:                                   # synthetic peers (documentation IPs, RFC 5737)
             ips = rng.sample(PEER_POOL, min(40, max(1, (seeds + int(seeds * .6)) // 3)))
             if rng.random() < 0.35:
@@ -37,10 +36,10 @@ def seed(d, n=3000, days=40, seed_=11):
                 role = rng.choice([1, 1, 0, -1]) if seeds else rng.choice([0, -1])
                 st.peers.note(ih, ip, rng.randint(1025, 65000), role, rng.choice(CLIENTS) if role != -1 else "",
                               "c" if role != -1 else rng.choice("da"), now=now - rng.randint(0, 86400 * 5))
-    st.compact_journal()
+    st.checkpoint()
     # history: cumulative counters consistent with the N torrents and their indexing dates
     cum = lambda t: sum(1 for x in times if x <= t)
-    files_total = st.total_files
+    files_total = st.analytics()["files"]
     st.stats.counters.update({"hashes_new": n * 90, "metadata_ok": n, "probe_timeouts": n * 9, "stale_dropped": n * 80, "bep51_queries": n * 40, "bep51_replies": n * 4})
     idx_times = times
     step_raw, agg = 10, {name: S._Agg(step) for name, step, _ in S.TIERS[1:]}

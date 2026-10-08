@@ -383,3 +383,29 @@ table.data tr.sep td { border-top: 2px solid var(--line); }
 .changelog li { margin: 3px 0; }
 .changelog b { font-variant-numeric: tabular-nums; }
 @media (max-width: 560px) { .ver { display: none; } }
+
+/* ---- AI moderation ---- */
+.ai-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 14px; margin: 10px 0; }
+.ai-form .wide, .ai-form .ai-on { grid-column: 1 / -1; }
+.ai-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.ai-field > span { color: var(--ink-2); }
+.ai-field input[type=url], .ai-field input[type=text], .ai-field input[type=password], .ai-field input[type=number], .ai-field select,
+.ai-num { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); font-size: 13px; min-width: 0; }
+.ai-num { width: 64px; }
+.ai-cats { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.ai-thr { color: var(--ink); }
+.ai-sub { font-size: 14px; margin: 18px 0 6px; }
+.ai-test { margin: 8px 0; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.ai-test pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; }
+.ai-hist { display: flex; align-items: flex-end; gap: 3px; min-height: 30px; }
+.ai-bar { width: 14px; height: 30px; display: flex; align-items: flex-end; cursor: pointer; }
+.ai-bar i { display: block; width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; opacity: .75; }
+.ai-bar:hover i { opacity: 1; }
+.ai-bar:nth-child(n+10) i { background: var(--warn); }
+.chip.ai-score { font-variant-numeric: tabular-nums; font-weight: 600; }
+.chip.ai-score.hi { background: color-mix(in srgb, #e34948 22%, transparent); color: #c0392b; }
+.chip.ai-score.mid { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.chip.ai-score.lo { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+.ai-bulk { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.ai-card h3 { display: flex; align-items: baseline; gap: 6px; }
+@media (max-width: 600px) { .ai-form { grid-template-columns: 1fr; } }

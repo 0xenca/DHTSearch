@@ -14,6 +14,7 @@ from flask import Flask, abort, jsonify, request, send_from_directory
 
 import admin
 from version import VERSION_DATE, __version__, info as version_info
+from memstat import process_memory
 from store import Store
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +66,7 @@ def api_torrent(ih):
 def api_related(ih):
     if not _HASH_RE.match(ih):
         return jsonify([]), 400
-    if ih.lower() in STATE["store"].hidden and not admin.is_admin():
+    if STATE["store"].is_hidden(ih) and not admin.is_admin():
         return jsonify([]), 404
     return jsonify(STATE["store"].related(ih))
 
@@ -79,6 +80,7 @@ def api_stats():
         "uptime": int(time.time() - STATE["started"]),
         "live": c.snapshot() if c else {},
         "analytics": STATE["store"].analytics(),
+        "memory": process_memory(),
     })
 
 
@@ -138,9 +140,12 @@ def _flusher(store, stop):
             store.flush()
             if ticks % 40 == 0:                     # every ~10 min
                 res = store.maintenance()
-                if res["failed_purged"] or res["compacted"] or res.get("peers_expired") or res.get("peers_capped"):
+                if res["failed_purged"] or res.get("checkpoint") or res.get("peers_expired") or res.get("peers_capped"):
                     trim_memory()
-                    logging.info("maintenance: %s (RSS %d MB)", res, _rss_mb())
+                    m = process_memory()
+                    logging.info("maintenance: %s (RSS %s MB: program %s MB; cgroup %s MB of which page cache %s MB)", res,
+                                 m.get("rss_mb"), m.get("rss_anon_mb"), (m.get("cgroup") or {}).get("total_mb"),
+                                 (m.get("cgroup") or {}).get("page_cache_mb"))
             if ticks % 5760 == 0:                   # every ~24 h
                 store.stats.compact_tiers()
         except Exception:
@@ -169,6 +174,8 @@ def main():
                    help="admin panel password (Ctrl+Alt+A on the web). Also TS_ADMIN_PASSWORD. Default \"admin\": change it")
     p.add_argument("--no-peers", action="store_true", help="do not store the peers (IPs) of each torrent")
     p.add_argument("--peer-ttl-days", type=int, default=30, help="days a peer is kept without being seen again")
+    p.add_argument("--persist-dht-peers", action="store_true",
+                   help="also write to disk the peers only known from DHT replies (unknown role): hundreds per second of writes")
     p.add_argument("--peer-max", type=int, default=500_000, help="max torrent-peer entries in memory (≈ 250 B each)")
     p.add_argument("--demo", action="store_true", help="synthetic data, no network and no libtorrent")
     p.add_argument("--selftest", action="store_true", help="checks the libtorrent API and exits")
@@ -183,10 +190,13 @@ def main():
 
     data_dir = args.data_dir or os.path.join(ROOT, "data-demo" if args.demo else "data")
     t0 = time.time()
-    store = Store(data_dir, {"enabled": not args.no_peers, "ttl_days": args.peer_ttl_days, "max_entries": args.peer_max})
+    store = Store(data_dir, {"enabled": not args.no_peers, "ttl_days": args.peer_ttl_days, "max_entries": args.peer_max,
+                             "persist_dht": args.persist_dht_peers})
     store.queue_max = args.queue_max
     STATE["store"] = store
-    admin.init(app, lambda: STATE["store"], args.admin_password, data_dir, lambda: STATE.get("crawler"))
+    from aimod import AIModerator
+    ai = STATE["ai"] = AIModerator(store, data_dir)
+    admin.init(app, lambda: STATE["store"], args.admin_password, data_dir, lambda: STATE.get("crawler"), lambda: STATE.get("ai"))
     if args.admin_password == "admin":
         logging.warning("admin panel with the DEFAULT password (\"admin\"). Change it with --admin-password "
                         "or TS_ADMIN_PASSWORD%s", " — and you are listening on " + args.host + "!" if args.host not in ("127.0.0.1", "localhost", "::1") else "")
@@ -211,12 +221,14 @@ def main():
                                   "use_trackers": not args.no_trackers, "refresh": not args.no_refresh})
     STATE["crawler"] = crawler
     crawler.start()
+    ai.start()                                     # does nothing until it is enabled in the admin panel
 
     stop = threading.Event()
     threading.Thread(target=_flusher, args=(store, stop), daemon=True).start()
 
     def shutdown():
         stop.set()
+        ai.stop()
         crawler.stop()
         time.sleep(0.5)
         store.close()

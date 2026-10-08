@@ -74,7 +74,7 @@ ps.note(H(2), "203.0.113.6", 6882, 0, "Transmission", "c")             # a real 
 ps.note(H(1), "203.0.113.5", 51413, 0, "qBittorrent 4.6", "c")          # the same peer in a NON-hidden torrent
 ps.note(H(3), "198.51.100.9", 1, 1, "", "c")
 ps.note(H(5), "198.51.100.9", 1, 1, "", "c")
-R = lambda ps_, ih, ip: ps_._row(ip, ps_.by_ih[ih][ip])          # entrada desempaquetada
+R = lambda ps_, ih, ip: ps_.entry(ih, ip)                         # unpacked entry
 e = R(ps, H(2), "203.0.113.6")
 assert e["port"] == 6882 and e["role"] == 0 and e["src"] == "cd" and e["client"] == "Transmission", e
 ps.note(H(2), "203.0.113.6", 6882, -1, "", "a")                          # unknown role does not downgrade
@@ -89,7 +89,7 @@ assert set(ps.find([ipaddress.ip_address("198.51.100.9")], only_seeds=True)) == 
 ps.per_torrent = 3
 for i in range(10):
     ps.note(H(6), f"192.0.2.{i + 1}", 1000 + i, now=time.time() + i)
-assert len(ps.by_ih[H(6)]) == 3 and "192.0.2.10" in ps.by_ih[H(6)]
+assert ps.count(H(6)) == 3 and "192.0.2.10" in ps.ips_of(H(6))
 ps.per_torrent = 300
 print("peers: role, ports, sources, aggregate, IP/CIDR search, cap: OK")
 
@@ -109,13 +109,13 @@ cr = C.Crawler(st2, {"state_file": os.path.join(d, "x.bin")})
 job = C.Job(H(3), types.SimpleNamespace(get_peer_info=lambda: [PI(("8.8.8.8", 1)), PI(("9.9.9.9", 2), 0x400), PI(("10.0.0.1", 3)),
                                                               PI(("1.1.1.1", 4), 0, b"x", 1.0)]), "refresh", 20)
 cr._collect_peers(job)                                   # no metadata: unknown role unless the seeder flag is set
-got = st2.peers.by_ih[H(3)]
-assert R(st2.peers, H(3), "8.8.8.8")["role"] == -1 and R(st2.peers, H(3), "9.9.9.9")["role"] == 1 and "10.0.0.1" not in got, got   # IPs privadas fuera
+got = st2.peers.ips_of(H(3))
+assert R(st2.peers, H(3), "8.8.8.8")["role"] == -1 and R(st2.peers, H(3), "9.9.9.9")["role"] == 1 and "10.0.0.1" not in got, got   # private IPs left out
 job.saved = True
 cr._collect_peers(job)
 assert R(st2.peers, H(3), "8.8.8.8")["role"] == 0 and R(st2.peers, H(3), "1.1.1.1")["role"] == 1
 cr._on_alert(type("dht_get_peers_reply_alert", (), {"info_hash": H(3), "peers": staticmethod(lambda: [("4.4.4.4", 6881), ("192.168.1.2", 1)])})())
-assert "4.4.4.4" in got and "192.168.1.2" not in got
+got = st2.peers.ips_of(H(3)); assert "4.4.4.4" in got and "192.168.1.2" not in got
 cr._on_alert(type("dht_announce_alert", (), {"info_hash": H(3), "ip": "5.5.5.5", "port": 7000})())
 assert R(st2.peers, H(3), "5.5.5.5")["src"] == "a"
 started = []

@@ -1,5 +1,6 @@
 """
-Search engine over the Store's in-memory indexes.
+Search engine over the Store: an inverted index on disk (segindex.py) for the words, and the hot columns
+(colstore.py, numpy) for filters, sorting and facets.
 
 Query syntax (everything can be combined):
   word1 word2                all words (AND); the last one also matches as a prefix (search-as-you-type)
@@ -17,17 +18,20 @@ Query syntax (everything can be combined):
   alive:yes | health:dead | health:verified
 (Spanish aliases from older versions — tam, semillas, ficheros, edad, nombre, categoria — are still accepted.)
 """
-import bisect
 import difflib
-import heapq
 import math
 import re
 import time
 from collections import Counter
 
-from records import STATES, files_of, health_state
-from textutil import (AGE_BUCKETS, SIZE_BUCKETS, ALL_CATEGORIES, ext_of, health_brief, index_tokens, magnet_of, norm_map, resolve_cat,
+import numpy as np
+
+from colstore import CATEGORY_LIST, EXT_BITS, SRC_LIST, mask_exts
+from records import STATES
+from textutil import (AGE_BUCKETS, SIZE_BUCKETS, ALL_CATEGORIES, ext_of, health_brief, index_tokens, magnet_of, norm, norm_map, resolve_cat,
                       size_bucket, tokenize)
+
+_SIZE_EDGES = np.array([lim for _, lim in SIZE_BUCKETS[:-1]], np.float64)
 
 _SIZE_UNITS = {"": 1, "b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10, "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
                "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30, "t": 1 << 40, "tb": 1 << 40, "tib": 1 << 40}
@@ -265,95 +269,157 @@ def describe(query):
     return out
 
 
-# --------------------------------------------------------------- indexes
-_sorted_cache = {}
+# --------------------------------------------------------------- index lookups (numpy arrays of document ids)
+PHRASE_FILE_CHECKS = 5000        # phrase searches: candidates whose FILES are read from disk to confirm the phrase
+RANK_MAX = 5000                  # relevance ranking reads the names of at most this many candidates (the most seeded)
+NAME_SORT_MAX = 300_000          # sorting by name reads at most this many names
+_E = np.zeros(0, np.int64)
 
 
-def _sorted_keys(d):
-    """Sorted list of an index's tokens (for prefix lookups with bisect). Refreshed at most every 30 s."""
-    key = id(d)
-    now = time.time()
-    c = _sorted_cache.get(key)
-    if c is None or (c[1] != len(d) and now - c[0] > 30):
-        c = (now, len(d), sorted(d))
-        _sorted_cache[key] = c
-    return c[2]
+def _i64(a):
+    return a.astype(np.int64, copy=False)
 
 
-def _prefix_tokens(d, t, limit=4000):
-    keys = _sorted_keys(d)
-    i = bisect.bisect_left(keys, t)
-    out = []
-    while i < len(keys) and keys[i].startswith(t) and len(out) < limit:
-        out.append(keys[i])
-        i += 1
-    return out
+def _inter(a, b):
+    return np.intersect1d(a, b, assume_unique=True)
 
 
-def _indexes(store, scope):
-    if scope == "name":
-        return (store.name_index,)
-    if scope == "files":
-        return (store.file_index,)
-    return (store.name_index, store.file_index)
+class _Lookups:
+    """Index lookups of one search, memoized."""
 
+    def __init__(self, store):
+        self.ix, self.c, self.n = store.index, {}, {}
 
-def _postings(store, t, scope, prefix=False):
-    out = set()
-    for d in _indexes(store, scope):
-        out.update(d.iter(t))
-        if prefix and len(t) >= 3:
-            for k in _prefix_tokens(d, t):
-                if k != t:
-                    out.update(d.iter(k))
-    return out
+    def keys(self, field, t, prefix=False):
+        k = (field, t, prefix)
+        v = self.c.get(k)
+        if v is None:
+            key = field + t.encode()
+            v = self.c[k] = _i64(self.ix.prefix_postings(key) if prefix else self.ix.postings(key))
+        return v
 
+    def count(self, field, t):
+        k = (field, t)
+        v = self.n.get(k)
+        if v is None:
+            v = self.n[k] = self.ix.count(field + t.encode())
+        return v
 
-def _df(store, t):
-    return max(store.name_index.count(t), store.file_index.count(t))
+    def postings(self, t, scope, prefix=False):
+        prefix = prefix and len(t) >= 3
+        parts = []
+        if scope in ("all", "name"):
+            parts.append(self.keys(b"n", t, prefix))
+        if scope in ("all", "files"):
+            parts.append(self.keys(b"f", t, prefix))
+        if not parts:
+            return _E
+        return parts[0] if len(parts) == 1 else np.union1d(parts[0], parts[1])
+
+    def all_words(self, field, words):
+        acc = None
+        for w in words:
+            p = self.keys(field, w)
+            acc = p if acc is None else _inter(acc, p)
+            if not len(acc):
+                break
+        return acc if acc is not None else _E
 
 
 def _norm_text(s):
     return " " + " ".join(tokenize(s)) + " "
 
 
-def _phrase_hit(rec, phrase, scope):
-    needle = " " + " ".join(phrase) + " "
-    if scope in ("all", "name") and needle in _norm_text(rec["name"]):
-        return True
-    if scope in ("all", "files"):
-        for path, _ in files_of(rec)[:200]:
-            if needle in _norm_text(path):
-                return True
-    return False
-
-
-def _group_set(store, g, scope, last_prefix_token):
-    """Torrents matching a group (AND words + phrases – exclusions). None = no text restriction."""
+def _group_set(store, g, scope, last_prefix_token, lk, live):
+    """Documents matching a group (AND words + phrases – exclusions) -> (sure, maybe). None = no text restriction.
+    maybe = {doc: [(phrase needle, must_be_present)]} still to be checked against the FILES (read from disk)."""
     sets = []
     for t, sc in g["pos"]:
-        sets.append(_postings(store, t, sc or scope, prefix=(t == last_prefix_token and sc is None)))
+        sets.append(lk.postings(t, sc or scope, t == last_prefix_token and sc is None))
     for ph in g["phrases"]:
         for t in ph:
-            sets.append(_postings(store, t, scope))
+            sets.append(lk.postings(t, scope))
     if not sets:
         if not g["neg"] and not g["negphrases"]:
-            return None
-        acc = set(store.torrents)
+            return None, {}
+        acc = live
     else:
         sets.sort(key=len)
-        acc = set(sets[0])
+        acc = sets[0]
         for s in sets[1:]:
-            acc &= s
-            if not acc:
+            acc = _inter(acc, s)
+            if not len(acc):
                 break
-    if g["phrases"] and acc:
-        acc = {ih for ih in acc if all(_phrase_hit(store.torrents[ih], ph, scope) for ph in g["phrases"])}
     for t, sc in g["neg"]:
-        acc -= _postings(store, t, sc or scope)
-    for ph in g["negphrases"]:
-        acc = {ih for ih in acc if not _phrase_hit(store.torrents[ih], ph, scope)}
-    return acc
+        acc = np.setdiff1d(acc, lk.postings(t, sc or scope), assume_unique=True)
+    checks = [(ph, True) for ph in g["phrases"]] + [(ph, False) for ph in g["negphrases"]]
+    if not checks or not len(acc):
+        return acc, {}
+    in_name, in_files = scope in ("all", "name"), scope in ("all", "files")
+    maybe = {}
+    for words, positive in checks:
+        needle = " " + " ".join(words) + " "
+        name_hit = _E
+        if in_name:                       # only documents whose NAME has every word can have the phrase in the name
+            nc = _inter(acc, lk.all_words(b"n", words))
+            if len(nc):
+                name_hit = np.array([d for d in nc.tolist() if needle in _norm_text(store.name_of(d))], np.int64)
+        fc = np.setdiff1d(_inter(acc, lk.all_words(b"f", words)), name_hit, assume_unique=True) if in_files else _E
+        for d in fc.tolist():
+            maybe.setdefault(d, []).append((needle, positive))
+        if positive:
+            acc = np.union1d(name_hit, fc)
+        else:
+            acc = np.setdiff1d(acc, name_hit, assume_unique=True)
+    maybe = {d: v for d, v in maybe.items() if v}
+    if maybe:
+        m = np.fromiter(maybe, np.int64, len(maybe))
+        keep = np.isin(m, acc)
+        maybe = {d: maybe[d] for d in m[keep].tolist()}
+        acc = np.setdiff1d(acc, m, assume_unique=False)
+    return acc, maybe
+
+
+def _check_files(store, maybe, warnings):
+    """Confirms phrase checks against the files read from disk. Returns the documents that pass."""
+    if not maybe:
+        return set()
+    ok = set()
+    docs = np.fromiter(maybe, np.int64, len(maybe))
+    if len(docs) > PHRASE_FILE_CHECKS:                       # the most seeded first
+        sd = store.cols.c["seeders"][docs]
+        chosen = docs[np.argpartition(-sd.astype(np.int64), PHRASE_FILE_CHECKS)[:PHRASE_FILE_CHECKS]]
+        cs = set(chosen.tolist())
+        rest = [d for d in maybe if d not in cs]
+        # beyond the cap: a document that only had EXCLUSIONS to check is kept (not checked), one that needed a phrase
+        # to be present is left out (not confirmed); the warning says which one applies
+        ok.update(d for d in rest if all(not p for _, p in maybe[d]))
+        if any(p for d in rest for _, p in maybe[d]):
+            warnings.append(f"Phrase searched inside the files of the {PHRASE_FILE_CHECKS:,} most seeded candidates only; "
+                            "narrow the search to check them all")
+        if any(not p for d in rest for _, p in maybe[d]):
+            warnings.append(f"Excluded phrase checked inside the files of the {PHRASE_FILE_CHECKS:,} most seeded "
+                            "candidates only; less seeded results may still contain it in a file name")
+        docs = chosen
+    for d, r in store.iter_cold(docs):
+        checks = maybe[d]
+        found = [False] * len(checks)
+        words = [needle.split() for needle, _ in checks]
+        for p, _ in r.get("files") or []:
+            n = norm(p)
+            x = None
+            for i, ws in enumerate(words):
+                if found[i] or not all(w in n for w in ws):          # cheap substring test before tokenizing
+                    continue
+                if x is None:
+                    x = _norm_text(p)
+                if checks[i][0] in x:
+                    found[i] = True
+            if all(found):
+                break
+        if all(f == positive for f, (_, positive) in zip(found, checks)):
+            ok.add(d)
+    return ok
 
 
 def _hl_terms(query):
@@ -407,9 +473,9 @@ def highlight(text, terms):
     return out
 
 
-def _matched_files(rec, terms, limit=3):
+def _matched_files(files, terms, limit=3):
     scored = []
-    for path, size in files_of(rec)[:500]:
+    for path, size in files[:500]:
         n = " " + " ".join(tokenize(path))
         hits = sum(1 for t in terms if (" " + t) in n)
         if hits:
@@ -419,22 +485,14 @@ def _matched_files(rec, terms, limit=3):
 
 
 # --------------------------------------------------------------- search
-def _health_ok(r, h):
-    if h == "verified":
-        return r.get("health_src") == "scrape"
-    if h == "unverified":
-        return r.get("health_src") != "scrape"
-    return health_state(r) == h
-
-
 def _is_trivial(q, f):
     return (not q and not f["cats"] and not f["not_cats"] and not f["exts"] and not f["not_exts"] and not f["health"]
             and not f["hash"] and f["scope"] == "all"
             and all(f[k][0] == 0 and f[k][1] == INF for k in ("size", "seeds", "peers", "files", "age")))
 
 
-def _score(r, terms, idf, phrases_in_name, plain):
-    ntoks = tokenize(r["name"])
+def _score(name, seeders, verified, terms, idf, phrases_in_name, plain):
+    ntoks = tokenize(name)
     nset = set(ntoks)
     s, in_name = 0.0, 0
     for t in terms:
@@ -452,21 +510,30 @@ def _score(r, terms, idf, phrases_in_name, plain):
         s += 3.0
     if plain and " ".join(ntoks) == plain:
         s += 6.0
-    if r.get("health_src") == "scrape":
-        s += 0.6 * math.log10(1 + r["seeders"])
+    if verified:
+        s += 0.6 * math.log10(1 + seeders)
     return s
 
 
-def _sort_key(name):
-    return {
-        "seeders": lambda r: (r["seeders"], r["peers"]),
-        "peers": lambda r: (r["peers"], r["seeders"]),
-        "size": lambda r: r["size"],
-        "files": lambda r: r["file_count"],
-        "date": lambda r: r.get("indexed_at", 0),
-        "created": lambda r: r.get("created", 0),
-        "name": lambda r: " ".join(tokenize(r["name"])),
-    }.get(name)
+def _hash_docs(store, h, live):
+    if len(h) == 40:
+        d = store.doc(h)
+        return np.array([d], np.int64) if d >= 0 else _E
+    ih = store.cols.ih[: store.cols.n]
+    k = len(h) // 2
+    m = np.all(ih[:, :k] == np.frombuffer(bytes.fromhex(h[: 2 * k]), np.uint8), axis=1) if k else np.ones(len(ih), bool)
+    if len(h) % 2:
+        m &= (ih[:, k] >> 4) == int(h[-1], 16)
+    return _inter(np.flatnonzero(m).astype(np.int64), live)
+
+
+def _top(keys, k, desc):
+    """Indexes of the k first rows by keys (list of arrays, most significant LAST, like np.lexsort)."""
+    n = len(keys[0])
+    if n == 0:
+        return np.zeros(0, np.int64)
+    order = np.lexsort([(-x.astype(np.float64) if desc else x) for x in keys])
+    return order[:k]
 
 
 def run(store, p):
@@ -476,6 +543,7 @@ def run(store, p):
     applied_in_query = describe(query)            # only what was typed in the query itself (operators)
     apply_params(query, p)
     f, groups = query["f"], query["groups"]
+    warnings = query["warnings"]
     try:
         page = max(1, int(p.get("page", 1)))
         per_page = min(100, max(5, int(p.get("per_page", 20))))
@@ -483,10 +551,11 @@ def run(store, p):
         page, per_page = 1, 20
     sort = p.get("sort") or "relevance"
     order = p.get("order") or ("asc" if sort == "name" else "desc")
+    desc = order != "asc"
     want_facets = str(p.get("facets", "1")) != "0"
     trivial = _is_trivial(q, f)
     ckey = (sort, order, page, per_page, want_facets)
-    if trivial:                                   # home / browsing without filters: short cache (would scan the whole catalogue)
+    if trivial:                                   # home / browsing without filters: short cache
         c = store.__dict__.setdefault("_qcache", {}).get(ckey)
         if c and time.time() - c[0] < 20:
             out = dict(c[1])
@@ -496,139 +565,166 @@ def run(store, p):
     terms = _hl_terms(query)
     has_text = any(g["pos"] or g["phrases"] for g in groups)
     now = time.time()
+    last_tok = None
+    for g in groups[-1:]:
+        plain = [t for t, sc in g["pos"] if sc is None]
+        last_tok = plain[-1] if plain else None
+    cols = store.cols
+    C = cols.c
+    N = cols.n
+    live = cols.live(N)
+    if (has_text or f["exts"] or f["not_exts"] or any(g["neg"] or g["negphrases"] for g in groups)) and not store.index_sync():
+        warnings.append("The search index is still being built: some matches may be missing")
 
-    with store.lock:
-        # --- candidates by text
-        last_tok = None
-        for g in groups[-1:]:
-            plain = [t for t, sc in g["pos"] if sc is None]
-            last_tok = plain[-1] if plain else None
-        if f["hash"]:
-            h = f["hash"]
-            cands = {h} if len(h) == 40 else {ih for ih in store.torrents if ih.startswith(h)}
-            cands &= set(store.torrents)
+    # --- 1) candidates by text (index on disk; phrases inside file names are confirmed reading the files)
+    lk = _Lookups(store)
+    if f["hash"]:
+        cands = _hash_docs(store, f["hash"], live)
+    else:
+        res = [_group_set(store, g, f["scope"], last_tok, lk, live) for g in groups]
+        if any(s is None for s, _ in res):
+            cands = None
         else:
-            sets = [_group_set(store, g, f["scope"], last_tok) for g in groups]
-            cands = None if any(s is None for s in sets) else set().union(*sets)
-        if cands is None:
-            cands = set(store.torrents)
-        hidden = store.__dict__.get("hidden")
-        if hidden:                                # admin panel rules: out of public search
-            cands.difference_update(hidden)
-        # --- extension restriction (index)
-        if f["exts"]:
-            u = set()
-            for e in f["exts"]:
-                u.update(store.ext_index.iter(e))
-            cands &= u
-        for e in f["not_exts"]:
-            cands.difference_update(store.ext_index.iter(e))
-        # --- field filters (only the active ones are checked)
-        recs_nocat, recs = [], []
-        T = store.torrents
-        checks = [(fld, lo, hi) for fld, (lo, hi) in (("size", f["size"]), ("seeders", f["seeds"]), ("peers", f["peers"]),
-                                                       ("file_count", f["files"])) if lo > 0 or hi < INF]
-        alo, ahi = f["age"]
-        age_on = alo > 0 or ahi < INF
-        health, cats, notcats = f["health"], f["cats"], f["not_cats"]
-        for ih in cands:
-            r = T.get(ih)
-            if r is None:
-                continue
-            ok = True
-            for fld, lo, hi in checks:
-                v = r[fld]
-                if v < lo or v > hi:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            if age_on:
-                a = now - r.get("indexed_at", 0)
-                if a < alo or a > ahi:
-                    continue
-            if health and not _health_ok(r, health):
-                continue
-            if notcats and r["category"] in notcats:
-                continue
-            recs_nocat.append(r)
-            if not cats or r["category"] in cats:
-                recs.append(r)
-        total = len(recs)
+            cands = res[0][0] if len(res) == 1 else np.unique(np.concatenate([s for s, _ in res]))
+            maybe = {}
+            have = set()
+            for _, m in res:
+                for d, chk in m.items():
+                    maybe.setdefault(d, []).append(chk)
+            if maybe:                                 # OR of groups: a document passes if ANY of its groups passes
+                passed = set()
+                for k in range(max(len(a) for a in maybe.values())):
+                    sub = {d: alts[k] for d, alts in maybe.items() if k < len(alts) and d not in passed}
+                    passed |= _check_files(store, sub, warnings)
+                if passed:
+                    cands = np.union1d(cands, np.fromiter(passed, np.int64, len(passed)))
+    if cands is None:
+        cands = live
+    else:
+        cands = _inter(_i64(cands), live)
+    hidden = store.hidden_docs()
+    if len(hidden):                                  # admin panel rules: out of public search
+        cands = np.setdiff1d(cands, hidden, assume_unique=True)
+    # --- extension restriction (index)
+    if f["exts"]:
+        u = np.unique(np.concatenate([lk.keys(b"e", e) for e in f["exts"]])) if f["exts"] else _E
+        cands = _inter(cands, u)
+    for e in f["not_exts"]:
+        cands = np.setdiff1d(cands, lk.keys(b"e", e), assume_unique=True)
 
-        # --- orden
-        rel = sort == "relevance" and has_text
-        if rel:
-            if len(recs) > 5000:
-                recs.sort(key=lambda r: r["seeders"], reverse=True)
-                recs = recs[:5000]
-            N = max(len(T), 1)
-            idf = {t: math.log(1 + N / (1 + _df(store, t))) for t in terms}
-            plain_q = " ".join(t for t, sc in groups[0]["pos"] if sc is None) if len(groups) == 1 else ""
-            allph = [ph for g in groups for ph in g["phrases"]]
-            scored = []
-            for r in recs:
-                ph_in_name = bool(allph) and any((" " + " ".join(ph) + " ") in _norm_text(r["name"]) for ph in allph)
-                scored.append((_score(r, terms, idf, ph_in_name, plain_q), r["seeders"], r.get("indexed_at", 0), r))
-            scored.sort(key=lambda x: x[:3], reverse=(order != "asc"))
-            recs = [x[3] for x in scored]
+    # --- 2) field filters, vectorized
+    m = np.ones(len(cands), bool)
+    for col, (lo, hi) in (("size", f["size"]), ("seeders", f["seeds"]), ("peers", f["peers"]), ("file_count", f["files"])):
+        if lo > 0 or hi < INF:
+            v = C[col][cands].astype(np.float64)
+            m &= (v >= lo) & (v <= hi)
+    alo, ahi = f["age"]
+    if alo > 0 or ahi < INF:
+        a = now - C["indexed_at"][cands].astype(np.float64)
+        m &= (a >= alo) & (a <= ahi)
+    h = f["health"]
+    if h == "verified":
+        m &= C["src"][cands] == SRC_LIST.index("scrape")
+    elif h == "unverified":
+        m &= C["src"][cands] != SRC_LIST.index("scrape")
+    elif h:
+        m &= store.states(cands) == STATES.index(h)
+    if f["not_cats"]:
+        m &= ~np.isin(C["cat"][cands], [CATEGORY_LIST.index(c) for c in f["not_cats"] if c in CATEGORY_LIST])
+    recs_nocat = cands[m]
+    recs = recs_nocat
+    if f["cats"]:
+        recs = recs_nocat[np.isin(C["cat"][recs_nocat], [CATEGORY_LIST.index(c) for c in f["cats"] if c in CATEGORY_LIST])]
+    total = len(recs)
+
+    # --- 3) sorting: only what the page needs
+    start = (page - 1) * per_page
+    need = start + per_page
+    rel = sort == "relevance" and has_text
+    if rel:
+        pool = recs
+        if len(pool) > RANK_MAX:
+            pool = pool[np.argpartition(-C["seeders"][pool].astype(np.int64), RANK_MAX)[:RANK_MAX]]
+        idf = {t: math.log(1 + max(len(live), 1) / (1 + max(lk.count(b"n", t), lk.count(b"f", t)))) for t in terms}
+        plain_q = " ".join(t for t, sc in groups[0]["pos"] if sc is None) if len(groups) == 1 else ""
+        allph = [" " + " ".join(ph) + " " for g in groups for ph in g["phrases"]]
+        sc_src = SRC_LIST.index("scrape")
+        scored = []
+        for d in pool.tolist():
+            name = store.name_of(d)
+            ph_in = bool(allph) and any(x in _norm_text(name) for x in allph)
+            sd = int(C["seeders"][d])
+            scored.append((_score(name, sd, C["src"][d] == sc_src, terms, idf, ph_in, plain_q), sd, int(C["indexed_at"][d]), d))
+        scored.sort(key=lambda x: x[:3], reverse=desc)
+        page_docs = [x[3] for x in scored[start:need]]
+    elif sort == "name":
+        pool = recs
+        if len(pool) > NAME_SORT_MAX:
+            pool = pool[np.argpartition(-C["seeders"][pool].astype(np.int64), NAME_SORT_MAX)[:NAME_SORT_MAX]]
+            warnings.append(f"Sorted by name among the {NAME_SORT_MAX:,} most seeded results")
+        keyed = sorted(((" ".join(tokenize(store.name_of(d))), d) for d in pool.tolist()), reverse=desc)
+        page_docs = [d for _, d in keyed[start:need]]
+    else:
+        keys = {"seeders": ("peers", "seeders"), "peers": ("seeders", "peers"), "size": ("size",), "files": ("file_count",),
+                "date": ("indexed_at",), "created": ("created",)}.get(sort, ("peers", "seeders"))
+        if len(recs) > 4 * need and need <= 2000:          # only the start is needed: partial selection first
+            main = C[keys[-1]][recs].astype(np.float64)
+            kth = need - 1
+            v = (-np.partition(-main, kth)[kth]) if desc else np.partition(main, kth)[kth]
+            pool = recs[main >= v] if desc else recs[main <= v]     # every tie of the cut stays in (exact order)
         else:
-            key = _sort_key(sort) or _sort_key("seeders")             # orden desconocido -> seeders
-            desc = order != "asc"
-            k = (page - 1) * per_page + per_page
-            if len(recs) > 3000 and k <= 500:                        # only the start is needed: O(n log k)
-                recs = heapq.nlargest(k, recs, key=key) if desc else heapq.nsmallest(k, recs, key=key)
-            else:
-                recs.sort(key=key, reverse=desc)
+            pool = recs
+        o = _top([C[k][pool] for k in keys], need, desc)
+        page_docs = pool[o][start:need].tolist()
 
-        # --- results page
-        start = (page - 1) * per_page
-        results = []
-        for r in recs[start:start + per_page]:
-            item = {
-                "ih": r["ih"], "name": r["name"], "name_hl": highlight(r["name"], terms), "size": r["size"],
-                "file_count": r["file_count"], "seeders": r["seeders"], "peers": r["peers"],
-                "verified": r.get("health_src") == "scrape", "health_at": r.get("health_at", 0), "state": health_state(r),
-                "checked_at": r.get("checked_at", 0), "seed_ok_at": r.get("seed_ok_at", 0), "hd": health_brief(r),
-                "category": r["category"], "exts": r.get("exts", [])[:5], "indexed_at": r.get("indexed_at", 0),
-                "created": r.get("created", 0), "magnet": magnet_of(r), "private": bool(r.get("private")),
-            }
-            if terms and f["scope"] != "name":
-                nset = set(tokenize(r["name"]))
-                if not all(t in nset or any(n.startswith(t) for n in nset) for t in terms):
-                    item["matched_files"] = _matched_files(r, terms)
-            if not terms:
-                item["top_files"] = [x[0] for x in files_of(r)[:3]]
-            results.append(item)
+    # --- 4) results page (hot fields from the columns, cold ones from disk)
+    st = store.states(np.array(page_docs, np.int64)) if page_docs else []
+    results = []
+    sc_src = SRC_LIST.index("scrape")
+    for i, d in enumerate(page_docs):
+        name = store.name_of(d)
+        cold = store.cold(d)
+        ih = cols.ih_hex(d)
+        view = {"ih": ih, "name": name, "hd": cold.get("hd"), "trackers": cold.get("trackers")}
+        item = {
+            "ih": ih, "name": name, "name_hl": highlight(name, terms), "size": int(C["size"][d]),
+            "file_count": int(C["file_count"][d]), "seeders": int(C["seeders"][d]), "peers": int(C["peers"][d]),
+            "verified": bool(C["src"][d] == sc_src), "health_at": int(C["health_at"][d]), "state": STATES[int(st[i])],
+            "checked_at": int(C["checked_at"][d]), "seed_ok_at": int(C["seed_ok_at"][d]), "hd": health_brief(view),
+            "category": CATEGORY_LIST[int(C["cat"][d])], "exts": (cold.get("exts") if isinstance(cold.get("exts"), list) else mask_exts(int(C["exts"][d])))[:5],
+            "indexed_at": int(C["indexed_at"][d]), "created": int(C["created"][d]), "magnet": magnet_of(view),
+            "private": bool(C["flags"][d] & 1),
+        }
+        files = [tuple(x) for x in cold.get("files") or []]
+        if terms and f["scope"] != "name":
+            nset = set(tokenize(name))
+            if not all(t in nset or any(n.startswith(t) for n in nset) for t in terms):
+                item["matched_files"] = _matched_files(files, terms)
+        if not terms:
+            item["top_files"] = [x[0] for x in files[:3]]
+        results.append(item)
 
-        # --- facets (optional: the web only asks for them on the first page)
-        facets = None
-        if want_facets:
-            if trivial and not hidden:            # with hidden torrents, the global counters would include them
-                facets = {
-                    "categories": [{"name": k, "count": v} for k, v in store.cat_counter.most_common()],
-                    "extensions": [{"name": k, "count": v} for k, v in store.ext_counter.most_common(14)],
-                    "sizes": [{"name": l, "count": store.bucket_counter.get(l, 0)} for l, _ in SIZE_BUCKETS],
-                    "states": store.analytics()["health_states"],
-                }
-            else:
-                cats_c = Counter(r["category"] for r in recs_nocat)
-                exts_c, sizes_c, states_c = Counter(), Counter(), Counter()
-                for r in recs:
-                    sizes_c[r["_sb"]] += 1
-                    states_c[health_state(r)] += 1
-                    for e in r.get("exts", [])[:6]:
-                        exts_c[e] += 1
-                facets = {
-                    "categories": [{"name": k, "count": v} for k, v in cats_c.most_common()],
-                    "extensions": [{"name": k, "count": v} for k, v in exts_c.most_common(14)],
-                    "sizes": [{"name": l, "count": sizes_c.get(l, 0)} for l, _ in SIZE_BUCKETS],
-                    "states": [{"name": k, "count": states_c.get(k, 0)} for k in STATES],
-                }
-        suggestion = _did_you_mean(store, q, groups) if total == 0 and has_text else None
+    # --- 5) facets (optional: the web only asks for them on the first page)
+    facets = None
+    if want_facets:
+        cats_c = np.bincount(C["cat"][recs_nocat], minlength=len(CATEGORY_LIST))
+        sizes_c = np.bincount(np.searchsorted(_SIZE_EDGES, C["size"][recs].astype(np.float64), side="right"),
+                              minlength=len(SIZE_BUCKETS))
+        states_c = np.bincount(store.states(recs), minlength=len(STATES))
+        em = C["exts"][recs]
+        exts_c = Counter({e: int(np.count_nonzero(em & np.uint32(1 << i))) for i, e in enumerate(EXT_BITS)})
+        exts_c = Counter({e: c for e, c in exts_c.items() if c})
+        facets = {
+            "categories": sorted(({"name": CATEGORY_LIST[i], "count": int(cats_c[i])} for i in range(len(CATEGORY_LIST))
+                                  if cats_c[i]), key=lambda x: -x["count"]),
+            "extensions": [{"name": k, "count": v} for k, v in exts_c.most_common(14)],
+            "sizes": [{"name": l, "count": int(sizes_c[i])} for i, (l, _) in enumerate(SIZE_BUCKETS)],
+            "states": [{"name": k, "count": int(states_c[i])} for i, k in enumerate(STATES)],
+        }
+    suggestion = _did_you_mean(store, q, groups, lk) if total == 0 and has_text else None
 
-    out = {"total": total, "page": page, "per_page": per_page, "pages": max(1, math.ceil(total / per_page)),
-           "results": results, "facets": facets, "terms": terms, "applied": applied_in_query, "warnings": query["warnings"],
+    out = {"total": int(total), "page": page, "per_page": per_page, "pages": max(1, math.ceil(total / per_page)),
+           "results": results, "facets": facets, "terms": terms, "applied": applied_in_query, "warnings": list(dict.fromkeys(warnings)),
            "suggestion": suggestion, "sort": sort if (sort != "relevance" or has_text) else "seeders",
            "took_ms": round((time.perf_counter() - t0) * 1000, 1)}
     if trivial:
@@ -639,18 +735,27 @@ def run(store, p):
     return out
 
 
-def _did_you_mean(store, q, groups):
+def _visible_count(store, key):
+    """Documents with this key that are not hidden."""
+    hid = store.hidden_docs()
+    p = store.index.postings(key)
+    return int(len(p) - np.isin(p, hid).sum()) if len(hid) else int(len(p))
+
+
+def _did_you_mean(store, q, groups, lk):
     fixes = {}
+    hid = store.hidden_docs()
     for g in groups:
         for t, sc in g["pos"]:
-            if sc or t.isdigit() or len(t) < 4 or _postings(store, t, "all", prefix=True):
+            if sc or t.isdigit() or len(t) < 4 or len(lk.postings(t, "all", True)):
                 continue
-            keys = [k for k in _prefix_tokens(store.name_index, t[0], 20000) if abs(len(k) - len(t)) <= 2]
-            best = difflib.get_close_matches(t, keys, n=3, cutoff=0.75)
-            hid = store.__dict__.get("hidden") or {}
-            best = [k for k in best if not hid or any(ih not in hid for ih in store.name_index.iter(k))]
+            keys = store.index.keys_with_prefix(b"n" + t[0].encode(), 20000)
+            words = {k[1:].decode(): c for k, c in keys.items() if abs(len(k) - 1 - len(t)) <= 2}
+            best = difflib.get_close_matches(t, list(words), n=3, cutoff=0.75)
+            if len(hid):
+                best = [k for k in best if _visible_count(store, b"n" + k.encode())]
             if best:
-                fixes[t] = max(best, key=lambda k: store.name_index.count(k))
+                fixes[t] = max(best, key=lambda k: words[k])
     if not fixes:
         return None
     words = []
@@ -670,45 +775,46 @@ def suggest(store, text, n=8):
     tk = tokenize(last)
     if not tk or len(tk[0]) < 2:
         return []
-    t = tk[0]
-    with store.lock:
-        cands = _prefix_tokens(store.name_index, t, 3000)
-        ranked = sorted(cands, key=store.name_index.count, reverse=True)
-        hid = store.__dict__.get("hidden")
-        if hid:                                   # do not suggest (or count) hidden torrents: it would reveal the term
-            vis = []
-            for k in ranked[: n * 6]:
-                c = sum(1 for ih in store.name_index.iter(k) if ih not in hid)
-                if c:
-                    vis.append((c, k))
-            vis.sort(key=lambda x: -x[0])
-            out = [{"text": (head + " " if head else "") + k, "count": c} for c, k in vis[:n]]
-        else:
-            out = [{"text": (head + " " if head else "") + k, "count": store.name_index.count(k)} for k in ranked[:n]]
-    return out
+    keys = store.index.keys_with_prefix(b"n" + tk[0].encode(), 3000)
+    ranked = sorted(keys.items(), key=lambda kv: -kv[1])
+    if len(store.hidden_docs()):                 # do not suggest (or count) hidden torrents: it would reveal the term
+        vis = [(_visible_count(store, k), k) for k, _ in ranked[: n * 6]]
+        ranked = [(k, c) for c, k in sorted(vis, key=lambda x: -x[0]) if c]
+    return [{"text": (head + " " if head else "") + k[1:].decode(), "count": c} for k, c in ranked[:n]]
 
 
 def related(store, ih, n=8):
-    with store.lock:
-        r = store.torrents.get(ih.lower())
-        if not r:
-            return []
-        toks = [t for t in index_tokens(r["name"]) if not t.isdigit() or len(t) == 4]
-        N = max(len(store.torrents), 1)
-        info = []
-        for t in toks:
-            df = store.name_index.count(t)
-            if 2 <= df <= max(50, N // 20):
-                info.append((math.log(1 + N / df), t))
-        info.sort(reverse=True)
-        info = info[:8]
-        score = Counter()
-        hid = store.__dict__.get("hidden") or {}
-        for w, t in info:
-            for other in store.name_index.iter(t):
-                if other != r["ih"] and other not in hid:
-                    score[other] += w
-        top = sorted(score.items(), key=lambda kv: (kv[1], store.torrents[kv[0]]["seeders"]), reverse=True)[:n]
-        return [{"ih": o, "name": store.torrents[o]["name"], "size": store.torrents[o]["size"],
-                 "seeders": store.torrents[o]["seeders"], "verified": store.torrents[o].get("health_src") == "scrape",
-                 "category": store.torrents[o]["category"], "score": round(s, 2)} for o, s in top]
+    d0 = store.doc(ih)
+    if d0 < 0:
+        return []
+    C = store.cols.c
+    toks = [t for t in index_tokens(store.name_of(d0)) if not t.isdigit() or len(t) == 4]
+    N = max(store.live_count, 1)
+    info = []
+    for t in toks:
+        df = store.index.count(b"n" + t.encode())
+        if 2 <= df <= max(50, N // 20):
+            info.append((math.log(1 + N / df), t))
+    info.sort(reverse=True)
+    info = info[:8]
+    if not info:
+        return []
+    parts = [_i64(store.index.postings(b"n" + t.encode())) for _, t in info]
+    weights = np.concatenate([np.full(len(p), w) for (w, _), p in zip(info, parts)])
+    docs = np.concatenate(parts)
+    uniq, inv = np.unique(docs, return_inverse=True)
+    score = np.bincount(inv, weights=weights)
+    keep = (uniq != d0) & ((C["flags"][uniq] & 2) == 0)
+    hid = store.hidden_docs()
+    if len(hid):
+        keep &= ~np.isin(uniq, hid)
+    uniq, score = uniq[keep], score[keep]
+    order = np.lexsort((-C["seeders"][uniq].astype(np.int64), -score))[:n]
+    sc = SRC_LIST.index("scrape")
+    return [{"ih": store.cols.ih_hex(d), "name": store.name_of(d), "size": int(C["size"][d]), "seeders": int(C["seeders"][d]),
+             "verified": bool(C["src"][d] == sc), "category": CATEGORY_LIST[int(C["cat"][d])], "score": round(float(score[i]), 2)}
+            for i, d in zip(order.tolist(), uniq[order].tolist())]
+
+
+def health_state_of(store, d):
+    return STATES[int(store.states(np.array([d], np.int64))[0])]

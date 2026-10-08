@@ -83,7 +83,7 @@
   const lbl = (list, v) => (list.find(x => x[0] === v) || [, v])[1];
   const E = {};                                         // node references
 
-  function ruleName(id) { const r = A.byId[id]; return r ? r.term : "(deleted rule)"; }
+  function ruleName(id) { if (id === "ai") return "AI moderation"; const r = A.byId[id]; return r ? r.term : "(deleted rule)"; }
   function sel(opts, value, onchange, aria) {
     const s = h("select", { "aria-label": aria }, opts.map(([v, l]) => h("option", { value: v }, l)));
     s.value = value; s.onchange = () => onchange(s.value); return s;
@@ -182,6 +182,7 @@
             h("b", null, "Contains"), ": also inside other words. ",
             h("b", null, "Regex"), ": Python regular expression."),
           E.preview, E.rulesBox),
+        buildAI(),
         h("section", { class: "tcard wide", id: "adm-hidden" },
           h("h2", null, "Hidden content and why"),
           h("div", { class: "adm-row" }, E.ruleSel1, E.hq, hsort, h("span", { class: "grow" }), E.refreshBtn),
@@ -196,6 +197,228 @@
             h("span", { class: "grow" }), allBtn),
           E.psum, E.pbox),
         E.searchCard));
+  }
+
+  /* ---------------------------------------------------------------- AI moderation */
+  const AI = { cfg: null, cats: [], state: "hidden", cat: "", min: 0, max: 100, q: "", sort: "score", page: 1, sel: new Set(), seq: 0 };
+  const AI_STATES = [["hidden", "Hidden by the AI"], ["allowed", "Shown again by you"], ["manual", "Hidden by you"],
+                     ["visible", "Analysed, visible"], ["all", "Everything analysed"]];
+  const STATE_CHIP = { hidden: ["warn", "hidden by AI"], allowed: ["ok", "shown (your decision)"], manual: ["warn", "hidden by you"], visible: ["ok", "visible"] };
+  const catLabel = k => (AI.cats.find(c => c.key === k) || { label: k }).label;
+  function scoreChip(s) { return h("span", { class: "chip ai-score " + (s >= 85 ? "hi" : s >= 50 ? "mid" : "lo"), title: "Confidence that it is NSFW / harmful" }, s + " %"); }
+
+  function buildAI() {
+    const f = E.ai = {};
+    f.status = h("div", { class: "muted small" }, "Loading…");
+    f.warn = h("div", { class: "adm-warn", hidden: true });
+    f.enabled = h("input", { type: "checkbox" });
+    f.endpoint = h("input", { type: "url", placeholder: "http://127.0.0.1:8091", "aria-label": "Model endpoint" });
+    f.profile = h("select", { "aria-label": "Model type" },
+      h("option", { value: "qwen3guard" }, "Qwen3Guard-Gen (recommended)"), h("option", { value: "llamaguard3" }, "Llama Guard 3"),
+      h("option", { value: "chat" }, "Any chat model (JSON answer)"));
+    f.model = h("input", { type: "text", placeholder: "Ollama: e.g. llama-guard3:1b · llama-server: empty", "aria-label": "Model name" });
+    f.api = h("select", { "aria-label": "Server API" },
+      h("option", { value: "auto" }, "Auto-detect"), h("option", { value: "ollama" }, "Ollama (native API, with probabilities)"),
+      h("option", { value: "openai" }, "OpenAI-compatible (llama.cpp, vLLM…)"));
+    f.key = h("input", { type: "password", placeholder: "(none)", autocomplete: "off", "aria-label": "API key" });
+    f.thr = h("input", { type: "range", min: "50", max: "100", step: "1", "aria-label": "Threshold" });
+    f.thrNum = h("b", { class: "ai-thr" });
+    f.thr.oninput = () => f.thrNum.textContent = f.thr.value + " %";
+    f.catsBox = h("div", { class: "ai-cats" });
+    f.files = h("input", { type: "number", min: "0", max: "20", "aria-label": "File names sent" });
+    f.rate = h("input", { type: "number", min: "0.05", max: "50", step: "0.05", "aria-label": "Requests per second" });
+    f.cw = h("input", { type: "number", min: "0", max: "1", step: "0.05", "aria-label": "Weight of controversial" });
+    f.timeout = h("input", { type: "number", min: "10", max: "3600", step: "10", "aria-label": "Timeout per request" });
+    f.backlog = h("input", { type: "checkbox" });
+    f.save = h("button", { type: "submit", class: "btn-s primary" }, "Save");
+    const field = (label, el, hint) => h("label", { class: "ai-field" }, h("span", null, label), el, hint ? h("small", { class: "muted" }, hint) : null);
+    const form = h("form", { class: "ai-form" },
+      h("label", { class: "switch ai-on" }, f.enabled, h("span", null, h("b", null, "AI moderation on"), " — analyses new torrents and hides those above the threshold. Off: nothing stays hidden by the AI (scores are kept).")),
+      field("Model endpoint", f.endpoint, "OpenAI-compatible server (llama.cpp llama-server, Ollama, LAN machine or hosted API)"),
+      field("Model type", f.profile), field("Model name", f.model), field("API key", f.key),
+      field("Server API", f.api, "Ollama gives probabilities only through its own API (version 0.12 or newer)"),
+      h("div", { class: "ai-field wide" }, h("span", null, "Hide from ", f.thrNum, " confidence"), f.thr,
+        h("small", { class: "muted" }, "Lower = hides more (more false positives). The change applies at once to everything already analysed.")),
+      h("div", { class: "ai-field wide" }, h("span", null, "Act on these categories"), f.catsBox,
+        h("small", { class: "muted" }, "Only these are asked to the model. Qwen3Guard has no separate “minors” category (it comes as sexual / illegal); Llama Guard 3 does. Changing them only affects new analyses: use “Re-analyse everything”.")),
+      field("File names sent", f.files, "besides the name (0 = name only)"),
+      field("Max requests / s", f.rate, "limits the CPU of the model server"),
+      field("“Controversial” counts as", f.cw, "0-1 of an “unsafe” answer"),
+      field("Timeout per request (s)", f.timeout, "how long to wait for one answer before retrying (slow model: 600)"),
+      h("label", { class: "switch ai-field" }, f.backlog, h("span", null, "Also analyse what was indexed before (newest first)")),
+      h("div", { class: "adm-row wide" }, h("span", { class: "grow" }), f.save));
+    form.onsubmit = e => { e.preventDefault(); saveAI(); };
+
+    f.testIn = h("input", { type: "text", placeholder: "A torrent name, or an infohash of an indexed torrent…", "aria-label": "Text to test" });
+    f.testBtn = h("button", { type: "submit", class: "btn-s" }, "Test now");
+    f.testOut = h("div", { class: "ai-test", hidden: true });
+    const tform = h("form", { class: "adm-form" }, f.testIn, f.testBtn);
+    tform.onsubmit = e => { e.preventDefault(); testAI(); };
+
+    f.hist = h("div", { class: "ai-hist" });
+    f.reBtn = h("button", { type: "button", class: "btn-s" }, "Re-analyse everything");
+    f.reBtn.onclick = async () => {
+      if (!confirm("Forget every AI score and analyse everything again?\nYour show/hide decisions are kept. With many torrents this takes hours of model CPU.")) return;
+      busy(f.reBtn, true, "…");
+      try { await req("POST", "/api/admin/ai/reanalyse-all"); toast("Everything will be analysed again (newest first)."); loadAI(); }
+      catch (e) { toast(e.message, true); } finally { busy(f.reBtn, false); }
+    };
+
+    /* list */
+    f.state = sel(AI_STATES, AI.state, v => { AI.state = v; AI.page = 1; loadAIList(); }, "State");
+    f.cat = h("select", { "aria-label": "Category" }); f.cat.onchange = () => { AI.cat = f.cat.value; AI.page = 1; loadAIList(); };
+    f.min = h("input", { type: "number", min: "0", max: "100", value: "0", class: "ai-num", "aria-label": "Minimum confidence" });
+    f.max = h("input", { type: "number", min: "0", max: "100", value: "100", class: "ai-num", "aria-label": "Maximum confidence" });
+    const rng = () => { AI.min = +f.min.value || 0; AI.max = f.max.value === "" ? 100 : +f.max.value; AI.page = 1; loadAIList(); };
+    f.min.onchange = rng; f.max.onchange = rng;
+    f.q = h("input", { type: "search", placeholder: "Filter by name or infohash…", "aria-label": "Filter" });
+    let qT; f.q.oninput = () => { clearTimeout(qT); qT = setTimeout(() => { AI.q = f.q.value.trim(); AI.page = 1; loadAIList(); }, 350); };
+    const sort = sel([["score", "Highest confidence"], ["seeders", "Most seeders"], ["date", "Recently indexed"], ["size", "Size"], ["name", "Name"]],
+      AI.sort, v => { AI.sort = v; AI.page = 1; loadAIList(); }, "Order");
+    f.sum = h("div", { class: "muted small" });
+    f.all = h("input", { type: "checkbox", "aria-label": "Select the whole page" });
+    f.all.onchange = () => { f.list.querySelectorAll("input.ai-pick").forEach(i => { i.checked = f.all.checked; i.onchange(); }); };
+    const bulk = (action, label, cls) => h("button", { type: "button", class: "btn-s " + (cls || ""), onclick: () => aiAction([...AI.sel], action) }, label);
+    f.bulk = h("div", { class: "adm-row ai-bulk" }, h("label", { class: "switch" }, f.all, h("span", null, "Page")),
+      f.selN = h("span", { class: "muted small" }, ""), h("span", { class: "grow" }),
+      bulk("allow", "Show again", "primary"), bulk("hide", "Hide"), bulk("reset", "Back to AI verdict"), bulk("reanalyse", "Re-analyse"));
+    f.list = h("div", { class: "adm-list" });
+    f.pager = h("div", { class: "pager" });
+
+    return h("section", { class: "tcard wide", id: "adm-ai" },
+      h("h2", null, "AI moderation (NSFW / harmful)"),
+      h("p", { class: "muted small" }, "A safety model reads the name and first file names of each torrent and gives a confidence that it is NSFW or harmful. ",
+        "Above the threshold the torrent is ", h("b", null, "hidden"), " like with a rule: not deleted, you can show it again at any time. ",
+        "The model runs in its own server (llama.cpp), so this service uses no extra RAM."),
+      f.warn, f.status, form,
+      h("h3", { class: "ai-sub" }, "Try it"), tform, f.testOut,
+      h("h3", { class: "ai-sub" }, "Analysed torrents"),
+      h("div", { class: "adm-row" }, f.hist, h("span", { class: "grow" }), f.reBtn),
+      h("div", { class: "adm-row" }, f.state, f.cat, h("span", { class: "small muted" }, "confidence"), f.min, h("span", { class: "muted" }, "–"), f.max, f.q, sort),
+      f.sum, f.bulk, f.list, f.pager);
+  }
+
+  function aiForm() {
+    const f = E.ai;
+    return { enabled: f.enabled.checked, endpoint: f.endpoint.value.trim(), profile: f.profile.value, model: f.model.value.trim(),
+             api_key: f.key.value, api: f.api.value, threshold: +f.thr.value, files: +f.files.value, max_rate: +f.rate.value,
+             controversial_weight: +f.cw.value, timeout: +f.timeout.value, backlog: f.backlog.checked,
+             act_on: [...f.catsBox.querySelectorAll("input:checked")].map(i => i.value) };
+  }
+  function fillAIForm(c) {
+    const f = E.ai;
+    f.enabled.checked = c.enabled; f.endpoint.value = c.endpoint; f.profile.value = c.profile; f.model.value = c.model;
+    f.key.value = c.api_key; f.api.value = c.api || "auto"; f.thr.value = c.threshold; f.thrNum.textContent = c.threshold + " %"; f.files.value = c.files;
+    f.rate.value = c.max_rate; f.cw.value = c.controversial_weight; f.timeout.value = c.timeout; f.backlog.checked = c.backlog;
+    f.catsBox.replaceChildren(...AI.cats.map(k => {
+      const i = h("input", { type: "checkbox", value: k.key }); i.checked = c.act_on.includes(k.key);
+      return h("label", { class: "switch" }, i, h("span", null, k.label));
+    }));
+    f.cat.replaceChildren(h("option", { value: "" }, "All categories"), ...AI.cats.map(k => h("option", { value: k.key }, k.label)));
+    f.cat.value = AI.cat;
+  }
+
+  async function loadAI(refillForm) {
+    if (!E.ai) return;
+    let s;
+    try { s = await req("GET", "/api/admin/ai"); }
+    catch (e) { E.ai.status.textContent = e.status === 404 ? "Not available in this mode." : "⚠ " + e.message; return; }
+    AI.cats = s.categories;
+    if (refillForm || !AI.cfg) fillAIForm(s.config);
+    AI.cfg = s.config;
+    const f = E.ai;
+    const st = { off: ["", "off"], idle: ["ok", "up to date"], working: ["ok", "analysing"] }[s.state] || ["", s.state];
+    const err = s.last_error && s.last_error_at > (s.last_ok_at || 0) && s.last_error_at >= (s.saved_at || 0) && s.error_endpoint === s.config.endpoint;
+    f.status.replaceChildren(
+      h("span", { class: "chip " + (err ? "warn" : st[0]) }, err ? "error" : st[1]), " ",
+      `${fmtNum(s.analysed)} analysed · ${fmtNum(s.pending)} pending · `, h("b", null, fmtNum(s.hidden)), " hidden by the AI · ",
+      `${fmtNum(s.allowed)} shown again by you · ${fmtNum(s.manual)} hidden by you` +
+      (s.avg_ms ? ` · ${Math.round(s.avg_ms)} ms per torrent` : "") + (s.errors ? ` · ${fmtNum(s.errors)} errors` : ""));
+    const warns = [];
+    if (err) warns.push("⚠ " + s.last_error + " (" + fmtRel(s.last_error_at) + ")" +
+      (s.backoff_until > Date.now() / 1000 ? ` — retrying in ${Math.ceil(s.backoff_until - Date.now() / 1000)} s` : ""));
+    if (s.logprobs === false && s.config.profile !== "chat") warns.push(s.api === "ollama"
+      ? "Ollama did not return probabilities (logprobs): it needs Ollama 0.12 or newer, and a proxy in between (IARemote…) must forward the logprobs / top_logprobs fields of /api/generate and its answer. Meanwhile the confidence is only 0 %, the “controversial” weight or 100 %."
+      : "The model server does not return probabilities (logprobs): the confidence is only 0 %, the “controversial” weight or 100 %. llama.cpp's llama-server returns them; for Ollama choose “Server API: Ollama” (a proxy in between must forward /api/generate).");
+    f.warn.hidden = !warns.length; f.warn.replaceChildren(...warns.map(w => h("div", null, w)));
+    const hist = s.histogram || [], max = Math.max(1, ...hist);
+    f.hist.replaceChildren(h("span", { class: "small muted" }, "Confidence of what was analysed: "),
+      ...hist.map((n, i) => h("span", { class: "ai-bar", title: `${i * 10}–${i * 10 + 9 + (i === 9 ? 1 : 0)} %: ${fmtNum(n)}`, onclick: () => { f.min.value = i * 10; f.max.value = i === 9 ? 100 : i * 10 + 9; f.state.value = AI.state = "all"; f.min.onchange(); } },
+        h("i", { style: `height:${Math.max(2, Math.round(28 * n / max))}px` }))));
+  }
+
+  async function saveAI() {
+    const f = E.ai;
+    busy(f.save, true, "Saving…");
+    try { const r = await req("POST", "/api/admin/ai/config", aiForm()); fillAIForm(r.config); AI.cfg = r.config; toast("AI settings saved."); loadAI(); loadAIList(); loadStatus(); }
+    catch (e) { toast(e.message, true); } finally { busy(f.save, false); }
+  }
+
+  async function testAI() {
+    const f = E.ai, v = f.testIn.value.trim();
+    if (!v) { f.testIn.focus(); return; }
+    busy(f.testBtn, true, `Asking the model… (up to ${f.timeout.value} s)`);
+    const body = /^[0-9a-fA-F]{40}$/.test(v) ? { ih: v } : { text: v };
+    try {
+      const r = await req("POST", "/api/admin/ai/test", { ...body, config: aiForm() });
+      f.testOut.hidden = false;
+      f.testOut.replaceChildren(
+        h("div", { class: "adm-row" }, scoreChip(r.score),
+          r.would_hide ? h("span", { class: "chip warn" }, "would be hidden") : h("span", { class: "chip ok" }, "would stay visible"),
+          ...r.cats.map(c => h("span", { class: "chip" }, catLabel(c))),
+          h("span", { class: "muted small" }, `${r.ms} ms · ${r.api === "ollama" ? "Ollama API" : r.api === "openai" ? "OpenAI-compatible API" : ""}` + (r.logprobs ? " · with probabilities" : " · NO probabilities (logprobs)"))),
+        h("div", { class: "mono small muted" }, "Model answer: " + r.raw),
+        h("details", null, h("summary", { class: "small muted" }, "Text sent"), h("pre", { class: "mono small" }, r.text)));
+    } catch (e) { f.testOut.hidden = false; f.testOut.replaceChildren(h("div", { class: "warn" }, "⚠ " + e.message)); }
+    finally { busy(f.testBtn, false); }
+  }
+
+  async function loadAIList() {
+    if (!E.ai) return;
+    const f = E.ai, my = ++AI.seq;
+    const p = new URLSearchParams({ state: AI.state, min: AI.min, max: AI.max, sort: AI.sort, page: AI.page, per_page: 20 });
+    if (AI.cat) p.set("cat", AI.cat);
+    if (AI.q) p.set("q", AI.q);
+    let d;
+    try { d = await req("GET", "/api/admin/ai/items?" + p); } catch (e) { if (e.status !== 404) f.list.replaceChildren(h("div", { class: "warn" }, "⚠ " + e.message)); return; }
+    if (my !== AI.seq) return;
+    AI.sel.clear(); f.all.checked = false; f.selN.textContent = "";
+    f.sum.textContent = `${fmtNum(d.total)} torrents` + (d.truncated ? " (name filter applied to the 200,000 highest scores)" : "");
+    f.bulk.hidden = !d.results.length;
+    f.list.replaceChildren(...(d.results.length ? d.results.map(aiCard) : [h("div", { class: "muted adm-empty" },
+      AI.cfg && !AI.cfg.enabled && AI.state === "hidden" ? "AI moderation is off: nothing is hidden by it." : "Nothing with these filters.")]));
+    pager(f.pager, d, pg => { AI.page = pg; loadAIList(); $("#adm-ai").scrollIntoView({ block: "start" }); });
+  }
+
+  function aiCard(t) {
+    const pick = h("input", { type: "checkbox", class: "ai-pick", "aria-label": "Select" });
+    pick.onchange = () => { pick.checked ? AI.sel.add(t.ih) : AI.sel.delete(t.ih); E.ai.selN.textContent = AI.sel.size ? `${AI.sel.size} selected` : ""; };
+    const act = (action, label, cls) => h("button", { type: "button", class: "btn-s " + (cls || ""), onclick: () => aiAction([t.ih], action) }, label);
+    const chip = STATE_CHIP[t.state] || ["", t.state];
+    return h("article", { class: "card adm-card ai-card" },
+      h("h3", null, pick, " ", h("a", { class: "tlink", href: "/torrent/" + t.ih, target: "_blank", rel: "noopener", title: "Torrent page (hidden ones: visible only to you)" }, t.name)),
+      h("div", { class: "row" },
+        t.analysed ? scoreChip(t.score) : h("span", { class: "chip" }, "not analysed"),
+        h("span", { class: "chip " + chip[0] }, chip[1]),
+        ...t.cats.map(c => h("span", { class: "chip" }, catLabel(c))),
+        t.error ? h("span", { class: "chip warn", title: "The model gave an unexpected answer for this one" }, "model error") : null,
+        h("span", { class: "seeds " + (t.verified ? "ver" : "est") }, "Seeders ", h("b", null, (t.verified ? "" : "≥ ") + fmtNum(t.seeders))),
+        h("span", null, "Size ", h("b", null, fmtBytes(t.size))), h("span", { class: "chip" }, t.category),
+        h("span", { title: fmtDateTime(t.indexed_at) }, "Indexed ", fmtRel(t.indexed_at))),
+      h("div", { class: "actions" },
+        t.state === "allowed" ? act("reset", "Back to AI verdict") : act("allow", "Show again", t.state === "hidden" || t.state === "manual" ? "primary" : ""),
+        t.state === "manual" ? act("reset", "Back to AI verdict") : t.state !== "hidden" ? act("hide", "Hide") : null,
+        act("reanalyse", "Re-analyse"),
+        h("button", { type: "button", class: "btn-s", onclick: e => copyText(t.ih, e.currentTarget) }, "Copy infohash")));
+  }
+
+  async function aiAction(ihs, action) {
+    if (!ihs.length) { toast("Select some torrents first.", true); return; }
+    try {
+      const r = await req("POST", "/api/admin/ai/items", { ihs, action });
+      toast({ allow: "Shown again", hide: "Hidden", reset: "Back to the AI's verdict", reanalyse: "Will be analysed again" }[action] + `: ${fmtNum(r.changed)} torrent${r.changed === 1 ? "" : "s"}.`);
+      loadAI(); loadAIList(); loadStatus();
+    } catch (e) { toast(e.message, true); }
   }
 
   function setRule(id) {
@@ -442,7 +665,7 @@
 
   async function refreshAll() {
     try { await loadRules(); } catch (e) { return; }
-    loadStatus(); loadHidden(); loadPeers();
+    loadStatus(); loadHidden(); loadPeers(); loadAI(true); loadAIList();
   }
 
   window.onAdminTab = () => {
@@ -451,6 +674,6 @@
     try { ip = sessionStorage.getItem("admSearchIp"); sessionStorage.removeItem("admSearchIp"); } catch {}
     if (ip) setTimeout(() => searchIp(ip), 300);
     clearInterval(A.statusTimer);
-    A.statusTimer = setInterval(() => { if (!document.hidden && currentTab === "admin") loadStatus(); else if (currentTab !== "admin") clearInterval(A.statusTimer); }, 10000);
+    A.statusTimer = setInterval(() => { if (!document.hidden && currentTab === "admin") { loadStatus(); loadAI(); } else if (currentTab !== "admin") clearInterval(A.statusTimer); }, 10000);
   };
 })();

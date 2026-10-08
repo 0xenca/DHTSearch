@@ -2,7 +2,31 @@
 
 BitTorrent DHT crawler + web search engine + persistent analytics. Data is stored as JSON (JSON Lines).
 
-## Getting started
+## Quick install (server)
+
+```bash
+sudo ./install.sh            # asks each setting; Enter keeps the default shown in [brackets]
+```
+
+| Question | Default |
+|---|---|
+| Install directory / data directory | `/opt/torrentcrawler` / `/opt/torrentcrawler/data` |
+| Service user | `torrentsearch` |
+| Listen on | `0.0.0.0` (every IPv4 interface); `::` = IPv4 + IPv6; `127.0.0.1` = behind a reverse proxy |
+| Web port (TCP) | `8080` |
+| DHT port (UDP) | `6881` — forward it on the router / Proxmox host |
+| Simultaneous metadata downloads | `150` |
+| Admin password | random (printed at the end, stored in `/etc/torrent-search/env`, root only) |
+| Open firewall (ufw / firewalld, if active) · back up existing data | yes · yes |
+
+It installs the packages (Debian/Ubuntu/Proxmox LXC, Fedora/RHEL), a virtualenv with the dependencies and libtorrent,
+writes `/etc/systemd/system/torrent-search.service`, runs the libtorrent self-test, starts the service and prints the URLs.
+**Running it again updates** the code and keeps the data; the current settings become the defaults.
+Unattended: `sudo ./install.sh --yes` (defaults, or environment variables `TS_DIR TS_DATA TS_USER TS_HOST TS_WEB_PORT
+TS_DHT_PORT TS_MAX_PROBES TS_ADMIN_PASSWORD TS_FIREWALL TS_BACKUP`). `sudo ./install.sh --uninstall` removes the service
+and the code but keeps the data.
+
+## Getting started (manual / development)
 
 ```bash
 pip install -r requirements.txt        # flask + libtorrent (>= 2.0.9)
@@ -19,6 +43,12 @@ refreshing seeders/peers of what is already indexed), `--no-trackers`, `--no-ref
 The running version is shown in the web header, in the analytics tab and at `/api/version` (with the changelog, see `version.py`).
 
 ## Upgrading
+
+**4.0 changes the data format.** `pip install -r requirements.txt` (adds numpy), stop the service, back up `data/`, start
+it: the first start converts `torrents.jsonl` once (it is kept as `torrents.jsonl.v3`) and builds the search index in the
+background (searches are partial until it finishes; the results page says so). Rollback to 3.x: stop the service and run
+`python tools.py export-v3 --apply` (writes `torrents.jsonl` again and moves the 4.x files to `data/v4-moved-<date>/`).
+`python tools.py info` shows what is on disk.
 
 ```bash
 systemctl stop torrent-search
@@ -61,25 +91,26 @@ systemctl start torrent-search
 | hide rules, blocklist, nodes | merged without duplicates |
 | not imported | `stats.json` / `history_*` (they would double count) and `trackers.txt` (it replaces the default trackers, and each extra tracker adds one scrape per probe: more network load) |
 
-Safety: dry run by default; with `--apply` it refuses to run while a process has `data/torrents.jsonl` open; `data/migrate_esp/` is only
-read; journals are only appended to and every other file is backed up to `data/migrate-backup-<date>/`, with an `undo.sh` that is valid
-until the service is started again. Running it twice imports nothing twice. Run as root, it keeps the owner of `data/` on the files it writes.
+Safety: dry run by default; with `--apply` it refuses to run while the service has `data/` open; `data/migrate_esp/` is only
+read; torrents and hashes are only added and every other file is backed up to `data/migrate-backup-<date>/` with the list of
+what was imported. `python migrate_es.py --undo data/migrate-backup-<date>` removes it again (also after the service has run). Running it twice imports nothing twice. Run as root, it keeps the owner of `data/` on the files it writes.
 Other directories: `--src DIR --dst DIR`.
 
-## What is in `data/`
+## What is in `data/` (4.x)
 
 | File | Contents |
 |---|---|
-| `torrents.jsonl` | Append-only JSON Lines journal: one event per line (`n` new torrent, `h` health measurement, `d` deletion). Writes are O(1); it compacts itself in the background. |
-| `hashes.json` | Pending / retrying / failed infohashes |
-| `stats.json` | Cumulative counters, lifetime totals (uptime, sessions, traffic) and cardinalities (HyperLogLog) |
-| `history_raw.json`, `history_m5.jsonl`, `history_h1.jsonl` | History at 3 resolutions: 10 s · 24 h, 5 min · 30 days, 1 h · 2 years |
-| `nodes.json` | DHT nodes seen (they seed sampling on startup) |
-| `blocklist.txt` | Regular expressions (one per line) matched against name and paths; applied when indexing **and on startup to what is already indexed** |
-| `hidden_rules.json` | Admin hide rules |
-| `peers.jsonl` | Peers (IP:port) seen per torrent — personal data, see below |
+| `meta.log` | Immutable part of every torrent (name, files, comment, trackers…), zlib-compressed, written ONCE and never rewritten |
+| `names.dat` | Torrent names (append-only), read from disk |
+| `state.bin` (+ `.prev`) | Checkpoint of the hot fields of every torrent as columns (~100 B per torrent): written once a day and on shutdown |
+| `health-N.wal` | Health measurements since the last checkpoint (replayed after a crash, deleted after the next checkpoint) |
+| `health.bin`, `health.strings` | Last 40 measurements + latest per-tracker breakdown: one 1 KiB slot per torrent updated in place (one 4 KiB page per measurement) |
+| `index/` | Search index (names, file names, extensions): immutable segments written sequentially, merged in the background. Safe to delete: it is rebuilt |
+| `hashes.json` + `hashes.jsonl` | Discovered infohashes: snapshot on shutdown + change log |
+| `hidden.json` | Torrents hidden by the admin rules (saved with the checkpoint so a restart does not rescan every file list) |
+| `stats.json`, `history_raw.jsonl`, `history_m5.jsonl`, `history_h1.jsonl` | Counters and history at 3 resolutions |
+| `nodes.json`, `blocklist.txt`, `hidden_rules.json`, `peers.jsonl` | As before (`peers.jsonl` holds IPs: personal data) |
 | `admin_secret.key` | Session signing key — never share or commit it |
-| `migrate_esp/`, `migrate-backup-*/` | Data to import and import backups (see above) |
 
 **Do not commit `data/` to a repository.**
 
@@ -108,6 +139,27 @@ Syntax (also under the "Search syntax" button on the site):
 | `hash:6f3a9c` | by infohash (≥ 6 characters) |
 
 Ranking weighs name > files, rarity of each word (IDF), density, exact phrase and, slightly, **verified** seeders.
+
+## AI moderation (Admin → AI moderation)
+
+A safety model rates every torrent's name (plus its first file names) and gives a **confidence** that it is NSFW or
+harmful. Above the threshold you choose the torrent is **hidden** exactly like with a hide rule — never deleted. The panel
+lists what was analysed with filters (hidden by the AI / shown again by you / hidden by you / visible; category;
+confidence range; name), and each torrent (or a selection) can be **shown again** (the AI never hides it again),
+hidden by hand, sent back to the AI's verdict or re-analysed. Changing the threshold applies instantly to everything
+already analysed; **switching the AI off** makes nothing hidden by it (the scores are kept for when it is switched on).
+"Try it" classifies any text with the settings in the form before saving them.
+
+The model runs in **its own process** (llama.cpp's `llama-server`), so the search engine's RAM does not change, and it
+can live on another machine. Recommended: **Qwen3Guard-Gen-0.6B** (Q4_K_M GGUF, ~480 MB file, ~0.7 GB RAM, 119 languages,
+labels Safe / Controversial / Unsafe + category). `install.sh` installs it optionally (`torrent-search-ai` service on
+127.0.0.1:8091, low CPU priority, 1 thread by default). Alternatives: Llama Guard 3 1B (has a separate "minors" category,
+8 languages, ~1 GB RAM, gated licence) or any chat model through an OpenAI-compatible API ("chat" profile).
+
+Cost: roughly 0.3–1 s of one CPU core per torrent with the 0.6B model (new torrents first, then the backlog newest
+first; `Max requests / s` caps it). Copyright is never asked (every film would be "unsafe"). It is a classifier reading
+names: expect false positives and misses — review the list, and use `blocklist.txt` for content that must not be
+indexed at all.
 
 ## Admin panel (Ctrl+Alt+A)
 
@@ -187,25 +239,20 @@ Knobs that DO increase the load — use them deliberately:
 In `/api/stats` → `live`: `incoming_connections` (if it stays at 0, the port is not open on the router), `connection_attempts` and
 `connect_timeouts`; in `counters`: `probe_nopeers`, `direct_connects`.
 
-## Memory
+## Memory and disk wear (4.x)
 
-Measured with a synthetic catalogue shaped like the production one (70,000 torrents, 3.6 M files, 12 health measurements with a 20-tracker
-breakdown, 300,000 peers), Python store only, without libtorrent:
+RAM holds only fixed-size columns per torrent (size, seeders, dates, category, flags, an extension bitmask, offsets):
+~100 B per torrent plus the infohash table (~16 B). Names, file lists, history, breakdowns and the search index live on
+disk and are read on demand (pread/mmap). The index keeps a bounded in-RAM delta (1 M postings) that is written as a
+segment when full. Nothing in RAM grows with the number of files or measurements.
 
-| | Before | Now |
-|---|---|---|
-| RSS after loading | ~2.0 GB | ~0.65 GB |
-| File index | 620 MB | 150 MB |
-| Per-tracker breakdown (`hd`) | 460 MB | 38 MB |
-| Health history (`hh`, 12 measurements; grows to 40) | 170 MB (→ ~570 MB) | 17 MB (→ ~50 MB) |
-| Records (repeated keys) | 165 MB | 81 MB |
-| Peers | 230 MB | 130 MB |
+Writes are sequential and written once: metadata appended to `meta.log`, index segments written once and merged by tiers,
+one 4 KiB page per health measurement, a daily checkpoint. The SQLite file index of 3.1 (≈ 2 MB written per indexed
+torrent) is gone.
 
-What changed (all in memory, `packing.py`): history and breakdown stored as `bytes` with `struct`; tracker URLs, errors and clients in
-interned tables; repeated keys and strings interned; inverted indexes store the infohash as-is when there is only one, a `tuple` when there
-are few and a `list` when there are many (instead of one `set` per token). **Files on disk are byte-identical** and there are no new reads
-or writes. Search is the same or slightly faster; startup ~10 % slower (packing while replaying the journal).
-Also: `malloc_trim` after loading and after each compaction, and `MALLOC_ARENA_MAX=2` in the service. The startup log shows the RSS.
+Recommended in the unit: `Environment=MALLOC_ARENA_MAX=2` (already in `deploy/torrent-search.service`) and
+`TimeoutStopSec=120` (the checkpoint is written on shutdown). `rss_anon_mb` in Analytics / `/api/stats` → `memory` is
+what the program holds; the page cache of mmapped index files is reclaimable.
 
 ## Are the seeders real? Who reports what and how to verify it
 
@@ -318,13 +365,14 @@ python tests/test_admin.py             # hide rules, peers, admin API (login, pu
 python tests/test_packing.py           # compact in-memory representations
 python tests/test_verify.py            # verify.py verdicts
 python tests/test_migrate_es.py        # importing Spanish-format data, undo, --to-legacy
+python tests/test_memory.py            # cold data on disk, history split, compaction with concurrent writes, file index, packed peers
 N=20000 python tests/test_migration_perf.py   # migration from the old format and performance
 ```
 
 ## Limits and notes
 
 - It cannot index "all" torrents: the DHT is not enumerable; you see the part your queries reach, and it grows over the days.
-- The whole catalogue lives in RAM (see Memory). Reference: 100,000 torrents → 30–40 s startup.
+- The hot part of the catalogue lives in RAM (~1.5 KB per torrent, see Memory); the rest is read from disk. Reference: 70,000 torrents → 10 s startup.
 - A DHT crawler indexes whatever circulates, **including copyrighted or illegal material**. You are responsible for how it is used: fill in
   `data/blocklist.txt` before exposing it, and do not publish it on the Internet without authentication and a reverse proxy (it runs
   Flask's development server).

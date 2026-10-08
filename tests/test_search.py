@@ -1,7 +1,7 @@
 """Search engine and store tests (indexes, journal, migration, retries)."""
 import json, os, random, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from store import Store, normalize_record
+from store import Store
 
 MB, GB = 1 << 20, 1 << 30
 import hashlib
@@ -127,45 +127,62 @@ for k in range(12): apply_health(rec3, 0, 0, nowt + k, "swarm", 0); rec3["health
 assert ivs[0] == 1800 * 2 and ivs[-1] == 3 * 86400 and all(b >= a for a, b in zip(ivs, ivs[1:])), ivs
 print("states alive/weak/quiet/dead/unknown and exponential backoff: OK")
 
-# --- persistencia: journal + reinicio
+# --- persistence (v4): metadata log + checkpoint + health WAL
 st.close()
-files = sorted(os.listdir(d)); assert "torrents.jsonl" in files and "torrents.json" not in files, files
-lines = open(d + "/torrents.jsonl").read().splitlines(); assert lines[0].startswith('{"t":"n"') and any('"t":"h"' in l for l in lines)
+files = sorted(os.listdir(d))
+assert {"meta.log", "state.bin", "names.dat", "health.bin", "health.strings", "index"} <= set(files) and "torrents.jsonl" not in files, files
 st2 = Store(d)
+assert st2.load_info["how"].startswith("checkpoint") and st2.load_info["events"] == 0, st2.load_info
 assert len(st2.torrents) == 11 and st2.get(H(1))["seeders"] == 900 and len(st2.get(H(1))["hh"]) == 2
-assert st2.search({"q": "ubuntu desktop"})["results"][0]["ih"] == H(1)                      # indexes rebuilt
+assert st2.search({"q": "ubuntu desktop"})["results"][0]["ih"] == H(1)
 assert st2.stats.life["sessions"] == 2
-print("journal persistence and index rebuild: OK")
-# compaction keeping concurrent writes
-for i in range(300): st2.update_health(H(3), i, 1, "scrape")
-before = st2.journal.lines; n = st2.compact_journal(); assert n == 11 and st2.journal.lines == 11, (before, n)
-st2.update_health(H(3), 4242, 1, "scrape"); st2.close(); st3 = Store(d); assert st3.get(H(3))["seeders"] == 4242 and len(st3.torrents) == 11
-print(f"journal compaction ({before} -> {n} lines) and continuity after compacting: OK")
-# truncated last line (power cut): ignored, the rest is not lost
-with open(d + "/torrents.jsonl", "a") as f: f.write('{"t":"n","r":{"ih":"dead')
-st3.close(); st4 = Store(d); assert len(st4.torrents) == 11; st4.close()
-print("journal truncated by a power cut: OK")
+print("checkpoint + reopen: OK")
+# crash (no close): the checkpoint + the WAL give back every measurement
+for i in range(300): st2.update_health(H(3), i, 1, "scrape", at=int(time.time()) + i)
+st2.update_health(H(3), 4242, 1, "scrape", at=int(time.time()) + 400)
+st2.flush()
+st3 = Store(d)
+assert st3.load_info["events"] >= 301 and st3.get(H(3))["seeders"] == 4242 and len(st3.get(H(3))["hh"]) == 40, st3.load_info
+print("crash: checkpoint + health WAL replayed: OK")
+# a record cut by a power failure at the end of meta.log is detected and cut
+st3.close()
+size = os.path.getsize(d + "/meta.log")
+with open(d + "/meta.log", "ab") as f: f.write(b"\x40\x00\x00\x00garbage")
+st4 = Store(d); assert len(st4.torrents) == 11 and os.path.getsize(d + "/meta.log") == size; st4.close()
+print("meta.log truncated by a power cut: OK")
+# checkpoint lost: rebuilt from meta.log, health from health.bin
+for x in ("state.bin", "state.bin.prev"):
+    os.remove(os.path.join(d, x))
+st5 = Store(d)
+assert st5.load_info["how"] == "rebuilt from meta.log" and len(st5.torrents) == 11 and st5.get(H(3))["seeders"] == 4242
+assert st5.search({"q": "ubuntu desktop"})["results"][0]["ih"] == H(1)
+# export to the 3.x format and back (rollback / migration path)
+st5.export_v3(os.path.join(d, "export.jsonl"))
+st5.close()
+dx = tempfile.mkdtemp(); os.replace(os.path.join(d, "export.jsonl"), os.path.join(dx, "torrents.jsonl"))
+stx = Store(dx)
+assert stx.load_info["how"] == "converted from 3.x" and len(stx.torrents) == 11 and stx.get(H(3))["seeders"] == 4242
+assert len(stx.get(H(3))["hh"]) == 40
+assert os.path.exists(os.path.join(dx, "torrents.jsonl.v3")) and stx.search({"q": "ubuntu desktop"})["total"] >= 1
+stx.close()
+print("checkpoint lost -> rebuilt; export to 3.x and conversion back: OK")
 
-# --- English on disk; a journal written by <= 2.9 (Spanish category names) is converted once at startup
+# --- 3.x / 2.9 data (Spanish category names, Spanish blocklist header) converted once at startup
 import json as _json
-dc = tempfile.mkdtemp(); stc = Store(dc)
-stc.save_torrent("c0" * 20, {"name": "Movie", "size": 5, "files": [("a.mkv", 5)]})
-stc.save_torrent("c1" * 20, {"name": "Pics", "size": 5, "files": [("a.jpg", 5)]})
-assert stc.torrents["c0" * 20]["category"] == "Video" and stc.get("c1" * 20)["category"] == "Images"
-stc.close()
-def disk_cats(d): return {o["r"]["ih"]: o["r"]["category"] for o in map(_json.loads, open(d + "/torrents.jsonl")) if o.get("t") == "n"}
-assert disk_cats(dc) == {"c0" * 20: "Video", "c1" * 20: "Images"}, disk_cats(dc)
-# simulate a 2.9 data dir: Spanish categories in the journal + the old Spanish blocklist header
-lines = open(dc + "/torrents.jsonl", encoding="utf-8").read().replace('"category":"Video"', '"category":"Vídeo"').replace('"category":"Images"', '"category":"Imágenes"')
-open(dc + "/torrents.jsonl", "w", encoding="utf-8").write(lines + _json.dumps({"t": "h", "ih": "c0" * 20, "s": 7, "p": 1, "a": int(time.time()), "g": "scrape", "n": 2}) + "\n")
+dc = tempfile.mkdtemp()
+with open(dc + "/torrents.jsonl", "w", encoding="utf-8") as f:
+    for ih, nm, fn, cat in (("c0" * 20, "Movie", "a.mkv", "Vídeo"), ("c1" * 20, "Pics", "a.jpg", "Imágenes")):
+        f.write(_json.dumps({"t": "n", "r": {"ih": ih, "name": nm, "size": 5, "file_count": 1, "files": [[fn, 5]], "category": cat,
+                                             "seeders": 0, "peers": 0, "health_src": "none", "hh": []}}, ensure_ascii=False) + "\n")
+    f.write(_json.dumps({"t": "h", "ih": "c0" * 20, "s": 7, "p": 1, "a": int(time.time()), "g": "scrape", "n": 2}) + "\n")
 import store as _store
 open(dc + "/blocklist.txt", "w", encoding="utf-8").write(_store.LEGACY_BLOCKLIST_HEADER + "badword\n")
 stc2 = Store(dc)
 assert stc2.legacy_converted == 2 and stc2.torrents["c0" * 20]["category"] == "Video" and stc2.get("c0" * 20)["seeders"] == 7
+assert stc2.get("c1" * 20)["category"] == "Images"
 assert stc2.search({"q": "cat:video"})["total"] == 1 and stc2.search({"q": "", "cat": "Vídeo"})["total"] == 1   # old links still work
 stc2.close()
-assert disk_cats(dc) == {"c0" * 20: "Video", "c1" * 20: "Images"} and "Vídeo" not in open(dc + "/torrents.jsonl", encoding="utf-8").read()
 assert open(dc + "/blocklist.txt", encoding="utf-8").read() == _store.BLOCKLIST_HEADER + "badword\n"
-stc3 = Store(dc); assert stc3.legacy_converted == 0 and stc3.get("c0" * 20)["seeders"] == 7; stc3.close()      # converted once only
-print("English on disk; 2.9 journal and blocklist header converted once at startup: OK")
+stc3 = Store(dc); assert stc3.get("c0" * 20)["seeders"] == 7 and stc3.load_info["how"].startswith("checkpoint"); stc3.close()
+print("3.x journal with Spanish categories converted once: OK")
 print("ALL OK (search/store)")

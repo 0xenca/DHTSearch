@@ -286,25 +286,25 @@ assert job.tr[TR[2]] == {"e": "timed out"} and job.tr[TR[3]] == {"ae": "host not
 # status: connected num_seeds count; list_seeds (PEX/DHT candidates) NO LONGER do
 job.handle.status = lambda: types.SimpleNamespace(num_seeds=2, list_seeds=900, num_peers=5, list_peers=4000)
 job.finish_at = time.time() - 1; ih_d = job.ih; cr6._service_jobs(time.time())
-rec = st6.torrents[ih_d]; d = unpack_hd(rec["hd"])
+rec = st6.get(ih_d); d = unpack_hd(rec["hd"])                         # full record: the breakdown is read from the journal
 assert rec["seeders"] == 120 and d["cs"] == 2 and d["cp"] == 3 and rec.get("seed_ok_at"), d
 assert unpack_hh(rec["hh"])[-1][5] == 2, "the history also stores confirmed seeders"
 m = C.__dict__.get("magnet_of") or __import__("textutil").magnet_of
 mg = m(rec)
 from urllib.parse import quote
 assert mg.index(quote(TR[0], safe="")) < mg.index(quote(TR[1], safe="")) < mg.index(quote(TR[2], safe="")), "the magnet carries the trackers, the one reporting most seeders first"
-st6.close(); st6b = Store(st6.dir); rr = st6b.torrents[ih_d]
+st6.close(); st6b = Store(st6.dir); rr = st6b.get(ih_d)
 assert unpack_hd(rr["hd"])["tr"][0]["s"] == 120 and unpack_hd(rr["hd"])["cs"] == 2, "the breakdown survives a restart (journal)"
 rep_ = cr6.tracker_report(); byu = {x["url"]: x for x in rep_}
 assert byu[TR[2]]["scrape_fail"] >= 1 and byu[TR[2]]["last_error"] == "timed out" and byu[TR[0]]["scrape_ok"] >= 1
-assert C.Crawler._tr_url(mk("x", url="udp://a:1/announce")) == "udp://a:1/announce", "libtorrent 1.2: atributo url"
+assert C.Crawler._tr_url(mk("x", url="udp://a:1/announce")) == "udp://a:1/announce", "libtorrent 1.2: url attribute"
 print("per-tracker breakdown, connected seeders only, persistence, magnet with trackers, tracker health: OK")
 
 # --- a worse non-scrape measurement does NOT refresh an old value (previously health_at became "now")
 from records import apply_health
 r0 = {"hh": [], "health_src": "scrape", "seeders": 50, "peers": 5, "health_at": 1000}
 apply_health(r0, 0, 0, 1000 + 86400, "swarm", 0, {"at": 1000 + 86400, "tr": [], "cs": 0, "cp": 0, "ci": 0, "dht": 0, "md": 0})
-assert r0["seeders"] == 50 and r0["health_at"] == 1000 and r0["checked_at"] == 1000 + 86400 and unpack_hd(r0["hd"])["cs"] == 0
+assert r0["seeders"] == 50 and r0["health_at"] == 1000 and r0["checked_at"] == 1000 + 86400
 assert refresh_due_at(r0) > 1000 + 86400, "the refresh is postponed using checked_at"
 print("figures kept with their REAL date: OK")
 
@@ -447,16 +447,24 @@ assert crd._no_dht_announce() is False, "--dht-announce: comportamiento antiguo"
 print("probing without announcing in the DHT (own lookup, peers to the probe, timing histogram): OK")
 
 
-# --- hashes.json: periodic saves do NOT include pending hashes (they expire in minutes); on shutdown they do
+# --- hashes: failures/retries go to hashes.jsonl as they happen (no periodic rewrite); a crash keeps them, pending ones
+# (they expire in minutes) are only saved on shutdown
 import json as _json
-sth = Store(tempfile.mkdtemp())
+dh = tempfile.mkdtemp()
+sth = Store(dh)
 sth.add_hash("aa" * 20, "bep51"); sth.add_hash("bb" * 20, "bep51"); sth.mark_failed(sth.next_pending())
-sth._last_flush["hashes"] = 0; sth.flush()
-saved = _json.load(open(os.path.join(sth.dir, "hashes.json")))
-assert list(saved) == ["bb" * 20] and saved["bb" * 20]["status"] == "failed", saved
-sth.close(); saved = _json.load(open(os.path.join(sth.dir, "hashes.json")))
-assert set(saved) == {"aa" * 20, "bb" * 20}
-print("hashes.json: periodic without pending, complete on shutdown: OK")
+sth.flush()
+log_ = [_json.loads(l) for l in open(os.path.join(dh, "hashes.jsonl"))]
+assert [e["t"] for e in log_] == ["s"] and log_[0]["i"] == "bb" * 20 and log_[0]["h"]["status"] == "failed", log_
+crash = Store(dh)                                        # no close: crash
+assert crash.hashes["bb" * 20]["status"] == "failed" and "aa" * 20 not in crash.hashes
+sth.close(); saved = _json.load(open(os.path.join(dh, "hashes.json")))
+assert set(saved) == {"aa" * 20, "bb" * 20} and os.path.getsize(os.path.join(dh, "hashes.jsonl")) == 0
+st_b = Store(dh); assert st_b.hashes["bb" * 20]["status"] == "failed" and st_b.hashes["aa" * 20]["status"] == "pending"
+st_b.add_hash("bb" * 20, "bep51"); st_b.hashes["bb" * 20]["failed_at"] = 0; st_b.add_hash("bb" * 20, "bep51")
+assert st_b.hashes["bb" * 20]["status"] == "pending"     # revived: removed from the log
+st_b.flush(); assert _json.loads(open(os.path.join(dh, "hashes.jsonl")).read().splitlines()[-1])["t"] == "x"
+print("hashes: change log (crash-safe), full snapshot on shutdown, no periodic rewrite: OK")
 
 # --- persistent cumulative traffic: only the DELTAS of each libtorrent session are added
 st7 = Store(tempfile.mkdtemp()); cr7 = C.Crawler(st7, {"state_file": os.path.join(st7.dir, "x.bin")})

@@ -41,7 +41,7 @@ for i in range(1000): st.note_peer(f"1.2.{i // 250}.{i % 250}")
 st.counters["hashes_new"] = 12345
 st.close()
 files = sorted(os.listdir(d)); print("files:", files)
-assert {"stats.json", "history_raw.json", "history_m5.jsonl", "history_h1.jsonl"} <= set(files)
+assert {"stats.json", "history_raw.jsonl", "history_m5.jsonl", "history_h1.jsonl"} <= set(files)
 
 st2 = Stats(d)                                                       # 'restart'
 snap = st2.snapshot()

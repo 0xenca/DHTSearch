@@ -1,5 +1,6 @@
 """Text and classification helpers shared by the store and the search engine."""
 import re
+import sys
 import unicodedata
 from collections import Counter
 from urllib.parse import quote, urlsplit
@@ -56,12 +57,15 @@ SEED_BUCKETS = [
 AGE_BUCKETS = [("Last 24 h", 86400), ("Last 7 days", 7 * 86400), ("Last 30 days", 30 * 86400), ("Older", float("inf"))]
 
 
+# every combining mark (accents…) -> removed, with str.translate (C speed; same result as filtering unicodedata.combining)
+_COMBINING = {c: None for c in range(sys.maxunicode + 1) if unicodedata.combining(chr(c))}
+
+
 def norm(s: str) -> str:
     s = s.lower()
     if s.isascii():                       # fast path: the vast majority of paths
         return s
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(c for c in s if not unicodedata.combining(c))
+    return unicodedata.normalize("NFKD", s).translate(_COMBINING)
 
 
 def tokenize(s: str):

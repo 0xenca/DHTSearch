@@ -47,7 +47,9 @@ function render(t) {
   const simQ = t.name.replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/).filter(w => w.length > 2).slice(0, 4).join(" ");
   const isAdmin = Array.isArray(t.peers_known);          // the API only sends peers to an admin session
   const hiddenBanner = t.hidden_by && t.hidden_by.length ? h("div", { class: "adm-banner", id: "adm-banner" },
-    h("b", null, "Hidden from public search"), " by " + t.hidden_by.length + " admin panel rule(s). Only you (with an admin session) see this page; for everyone else it does not exist.") : null;
+    h("b", null, "Hidden from public search"), " by " + [t.hidden_by.includes("ai") ? "AI moderation" : null,
+      t.hidden_by.filter(x => x !== "ai").length ? t.hidden_by.filter(x => x !== "ai").length + " admin panel rule(s)" : null].filter(Boolean).join(" and ") +
+    ". Only you (with an admin session) see this page; for everyone else it does not exist. Admin → AI moderation can show it again.") : null;
   main.replaceChildren(...[                              // replaceChildren(null) would insert the text "null"
     backLink(),
     hiddenBanner,

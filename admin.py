@@ -29,8 +29,9 @@ _FAILS_LOCK = threading.Lock()
 MAX_FAILS, FAIL_WINDOW = 5, 300
 
 
-def init(app, get_store, password, data_dir, get_crawler=None):
-    """Registers the blueprint. get_store / get_crawler: callables returning the Store and the crawler."""
+def init(app, get_store, password, data_dir, get_crawler=None, get_ai=None):
+    """Registers the blueprint. get_store / get_crawler / get_ai: callables returning the Store, the crawler and the
+    AI moderator."""
     key_path = os.path.join(data_dir, "admin_secret.key")
     try:
         with open(key_path, "rb") as f:
@@ -47,6 +48,7 @@ def init(app, get_store, password, data_dir, get_crawler=None):
                       SESSION_COOKIE_NAME="ts_admin", PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
     _CFG["get_store"] = get_store
     _CFG["get_crawler"] = get_crawler or (lambda: None)
+    _CFG["get_ai"] = get_ai or (lambda: None)
     _CFG["pwd"] = password
     _CFG["pwd_tag"] = hashlib.sha256(b"ts-admin:" + password.encode()).hexdigest()[:16]
     app.register_blueprint(bp)
@@ -353,14 +355,14 @@ def peer_search():
         return jsonify({"error": "Enter at least one valid IP or network (e.g. 203.0.113.7 or 203.0.113.0/24)", "invalid": bad}), 400
     found = st.peers.find(specs, only_seeds=only_seeds)
     hid = st.hidden
-    out, ips_found = [], set()
+    out, ips_found, recs = [], set(), []
     with st.lock:
         for ih, hits in found.items():
             r = st.torrents.get(ih)
             if r is None or (ih in hid and not include_hidden):
                 continue
             it = _brief(st, r)
-            it["magnet"] = magnet_of(r)
+            recs.append(r)
             ips_found.update(x[0] for x in hits)
             hits.sort(key=lambda x: (-x[1], -x[2]))
             it["match_count"] = len(hits)
@@ -368,5 +370,110 @@ def peer_search():
             it["matched"] = [{"ip": ip, "role": role, "last": last} for ip, role, last in hits[:30]]
             out.append(it)
     out.sort(key=lambda x: (-x["match_count"], -x["match_seeds"], -x["seeders"]))
-    return jsonify({"searched": len(specs), "invalid": bad, "total": len(out), "results": out[:500],
-                    "truncated": len(out) > 500, "ips_with_hits": len(ips_found)})
+    total, out = len(out), out[:501]
+    keep = {x["ih"] for x in out}
+    cold = st.cold_views([x for x in keep])                             # breakdown + trackers: from disk, no lock
+    for it in out:
+        c = cold.get(it["ih"]) or {}
+        it["magnet"] = magnet_of({"ih": it["ih"], "name": it["name"], "hd": c.get("hd"), "trackers": c.get("trackers")})
+    return jsonify({"searched": len(specs), "invalid": bad, "total": total, "results": out[:500],
+                    "truncated": total > 500, "ips_with_hits": len(ips_found)})
+
+
+# ------------------------------------------------------------ AI moderation (aimod.py)
+class _NoAI(Exception):
+    pass
+
+
+def _ai():
+    ai = _CFG["get_ai"]()
+    if ai is None:
+        raise _NoAI()
+    return ai
+
+
+@bp.errorhandler(_NoAI)
+def _no_ai(_e):
+    return jsonify({"error": "AI moderation is not available in this mode"}), 404
+
+
+@bp.get("/ai")
+def ai_status():
+    return jsonify(_ai().status())
+
+
+@bp.post("/ai/config")
+def ai_config():
+    try:
+        cfg = _ai().update(request.get_json(silent=True) or {})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "config": cfg, **_store().ai_counts()})
+
+
+@bp.post("/ai/test")
+def ai_test():
+    """Classifies a text or an indexed torrent NOW with the settings in the form (without saving them)."""
+    ai, st = _ai(), _store()
+    b = request.get_json(silent=True) or {}
+    try:
+        cfg = ai.validated(b.get("config") or {})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    text = str(b.get("text") or "").strip()[:900]
+    ih = str(b.get("ih") or "").strip().lower()
+    if ih:
+        d = st.doc(ih)
+        text = st.ai_text(d, cfg["files"]) if d >= 0 else None
+    elif text:
+        from aimod import torrent_text
+        text = torrent_text(text, [], 0)
+    if not text:
+        return jsonify({"error": "write a torrent name (or give an indexed infohash)"}), 400
+    t0 = time.time()
+    from aimod import ModelError, ModelUnreachable
+    try:
+        r = ai.classify(text, cfg)
+    except (ModelUnreachable, ModelError) as e:
+        return jsonify({"error": str(e)}), 502
+    except (ValueError, KeyError, TypeError) as e:
+        return jsonify({"error": f"the model at {cfg['endpoint']} answered something unexpected: {e}"}), 502
+    score = int(round(r["score"] * 100))
+    hides = score >= cfg["threshold"] and bool(set(r["cats"]) & set(cfg["act_on"]))
+    return jsonify({"text": text, "score": score, "cats": r["cats"], "label": r["label"], "logprobs": r["logprobs"], "api": r.get("api"),
+                    "raw": r["raw"], "would_hide": hides, "ms": int((time.time() - t0) * 1000)})
+
+
+@bp.get("/ai/items")
+def ai_items():
+    st = _store()
+    a = request.args
+    try:
+        page = max(1, int(a.get("page", 1)))
+        per = min(100, max(5, int(a.get("per_page", 20))))
+        smin, smax = int(a.get("min", 0)), int(a.get("max", 100))
+    except ValueError:
+        return jsonify({"error": "invalid number"}), 400
+    return jsonify(st.ai_list(state=a.get("state", "hidden"), smin=smin, smax=smax, cat=a.get("cat") or None,
+                              q=(a.get("q") or "").strip()[:200], sort=a.get("sort", "score"), page=page, per=per))
+
+
+@bp.post("/ai/items")
+def ai_items_action():
+    st = _store()
+    b = request.get_json(silent=True) or {}
+    ihs = [str(x) for x in (b.get("ihs") or [])][:5000]
+    action = b.get("action")
+    if action not in ("allow", "hide", "reset", "reanalyse"):
+        return jsonify({"error": "action must be allow, hide, reset or reanalyse"}), 400
+    n = st.ai_override(ihs, action)
+    if action == "reanalyse":
+        _ai().notify()
+    return jsonify({"ok": True, "changed": n, **st.ai_counts()})
+
+
+@bp.post("/ai/reanalyse-all")
+def ai_reanalyse_all():
+    _store().ai_reanalyse_all()
+    _ai().notify()
+    return jsonify({"ok": True, **_store().ai_counts()})

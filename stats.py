@@ -4,7 +4,7 @@ PERSISTENT statistics (survive restarts and deployments).
   · cumulative counters             -> stats.json
   · lifetime totals                 -> stats.json  (uptime, sessions, cumulative traffic)
   · unique items seen (peers, nodes)-> stats.json  (HyperLogLog: ~0.8 % error, fixed size, unbounded)
-  · history in 3 resolutions        -> history_raw.json (10 s · 24 h), history_m5.jsonl (5 min · 30 d), history_h1.jsonl (1 h · 2 years)
+  · history in 3 resolutions        -> history_raw.jsonl (10 s · 24 h), history_m5.jsonl (5 min · 30 d), history_h1.jsonl (1 h · 2 years)
 
 History points carry GAUGES (instantaneous values: averaged when aggregating) and cumulative COUNTERS
 (the last value is taken). With cumulative counters the rate can be derived at any resolution.
@@ -167,12 +167,20 @@ class Stats:
         self.hll_peers = HLL.from_b64(st["hll_peers"]) if st.get("hll_peers") else HLL()
         self.hll_nodes = HLL.from_b64(st["hll_nodes"]) if st.get("hll_nodes") else HLL()
 
-        # history (raw is migrated from the old stats.json["history"])
-        raw = load_json(os.path.join(data_dir, "history_raw.json"), None)
-        if raw is None:
-            raw = st.get("history", [])
+        # history. raw (10 s, 24 h) is APPENDED to history_raw.jsonl (it used to be rewritten whole every minute:
+        # ~3 GB/day of writes); older formats: history_raw.json, or stats.json["history"]
+        self._paths = {"raw": os.path.join(data_dir, "history_raw.jsonl"), "m5": os.path.join(data_dir, "history_m5.jsonl"),
+                       "h1": os.path.join(data_dir, "history_h1.jsonl")}
+        if os.path.exists(self._paths["raw"]):
+            raw = self._load_tier("raw", TIERS[0][2])
+        else:
+            raw = load_json(os.path.join(data_dir, "history_raw.json"), None)
+            if raw is None:
+                raw = st.get("history", [])
+            with open(self._paths["raw"], "w", encoding="utf-8") as f:
+                for pt in raw:
+                    f.write(json.dumps(pt, separators=(",", ":")) + "\n")
         self.tiers = {"raw": deque(raw)}
-        self._paths = {"m5": os.path.join(data_dir, "history_m5.jsonl"), "h1": os.path.join(data_dir, "history_h1.jsonl")}
         for name, step, keep in TIERS[1:]:
             self.tiers[name] = deque(self._load_tier(name, keep))
         self._agg = {name: _Agg(step) for name, step, _ in TIERS[1:]}
@@ -223,8 +231,7 @@ class Stats:
         f = self._files.get(name)
         if f is None:
             f = self._files[name] = open(self._paths[name], "a", encoding="utf-8")
-        f.write(json.dumps(pt, separators=(",", ":")) + "\n")
-        f.flush()
+        f.write(json.dumps(pt, separators=(",", ":")) + "\n")        # buffered: written in 8 KB blocks, flushed every 5 min
 
     def _trim_raw(self):
         cutoff = time.time() - TIERS[0][2]
@@ -243,7 +250,7 @@ class Stats:
             p["rxb"], p["txb"] = self.life["rx_bytes"], self.life["tx_bytes"]
             self.tiers["raw"].append(p)
             self._trim_raw()
-            self._raw_dirty = True
+            self._append_file("raw", p)
             for name, step, keep in TIERS[1:]:
                 out = self._agg[name].add(p)
                 if out:
@@ -323,27 +330,23 @@ class Stats:
         now = time.time()
         with self.lock:
             self.tick()
-            do_meta = force or now - self._last_flush["meta"] >= 30
-            do_raw = (force or now - self._last_flush["raw"] >= 60) and (self._raw_dirty or force)
-            meta = raw = None
+            do_meta = force or now - self._last_flush["meta"] >= 300          # counters: every 5 min (and on shutdown)
+            meta = None
             if do_meta:
                 meta = {"counters": dict(self.counters), "sources": dict(self.sources), "life": dict(self.life),
                         "first_start": self.life["first_start"], "hll_peers": self.hll_peers.to_b64(),
                         "hll_nodes": self.hll_nodes.to_b64()}
                 self._last_flush["meta"] = now
-            if do_raw:
-                raw = list(self.tiers["raw"])
-                self._last_flush["raw"] = now
-                self._raw_dirty = False
+                for f in self._files.values():
+                    f.flush()
         if meta is not None:                               # disk write happens OUTSIDE the lock
             atomic_write(os.path.join(self.dir, "stats.json"), meta)
-        if raw is not None:
-            atomic_write(os.path.join(self.dir, "history_raw.json"), raw)
 
     def compact_tiers(self):
-        """Rewrites the history .jsonl files without already-expired points (maintenance)."""
+        """Rewrites the history .jsonl files without already-expired points (maintenance, once a day)."""
         with self.lock:
-            for name, _, keep in TIERS[1:]:
+            self._trim_raw()
+            for name, _, keep in TIERS:
                 f = self._files.pop(name, None)
                 if f:
                     f.close()

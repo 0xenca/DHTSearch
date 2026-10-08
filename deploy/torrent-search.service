@@ -1,3 +1,4 @@
+# Reference unit. install.sh writes one with your settings to /etc/systemd/system/torrent-search.service.
 [Unit]
 Description=DHT Search (DHT crawler + web)
 After=network-online.target
@@ -15,8 +16,9 @@ ExecStart=/opt/torrentcrawler/venv/bin/python app.py --host 127.0.0.1 --port 808
 # Environment=TS_ADMIN_PASSWORD=change-me
 Restart=on-failure
 RestartSec=5
-# On stop, app.py flushes the JSON files (SIGTERM -> atexit); give it time.
-TimeoutStopSec=30
+# On stop, app.py writes the index delta and the checkpoint (SIGTERM -> atexit): a few seconds, up to ~1 min with
+# millions of torrents on a slow disk. If it is killed anyway nothing is lost (WAL replay + re-index on the next start).
+TimeoutStopSec=120
 KillSignal=SIGTERM
 # Memory: fewer malloc arenas (many threads: Flask + libtorrent). Without this glibc creates up to 8×cores arenas
 # and RSS grows by hundreds of MB without the program holding more data.

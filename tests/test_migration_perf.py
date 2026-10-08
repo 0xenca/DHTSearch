@@ -30,7 +30,7 @@ open(d + "/blocklist.txt", "w").write("# test\nFORBIDDEN\n")
 
 st = Store(d)
 fs = sorted(os.listdir(d))
-assert "torrents.jsonl" in fs and "torrents.json.migrated" in fs and "torrents.json" not in fs, fs
+assert "meta.log" in fs and "state.bin" in fs and "torrents.json.v3" in fs and "torrents.json" not in fs, fs
 assert len(st.torrents) == 300, len(st.torrents)                               # 301 - 1 purged by the blocklist
 assert st.counters["blocked_purged"] == 1 and st.search({"q": "forbidden"})["total"] == 0
 r = st.get("%040x" % 0xfeed05)
@@ -76,8 +76,12 @@ else:
 sz = os.path.getsize(d2 + "/torrents.jsonl") / 1e6
 print(f"synthetic corpus: {N:,} torrents, {sz:.0f} MB journal, generated in {time.time() - t0:.0f}s")
 t0 = time.time(); big = Store(d2); load = time.time() - t0
+t1 = time.time(); big.wait_index(); idx_s = time.time() - t1
 rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-print(f"startup (read journal + build indexes): {load:.1f}s | peak RAM ≈ {rss:.0f} MB | tokens: name={len(big.name_index):,} files={len(big.file_index):,}")
+print(f"first start (3.x journal -> 4.x storage): {load:.1f}s | index built in the background in {idx_s:.1f}s: {big.index.stats()}")
+big.close(); t0 = time.time(); big = Store(d2); load2 = time.time() - t0
+rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+print(f"normal start (checkpoint): {load2:.2f}s ({big.load_info['how']}) | peak RAM of the whole test ≈ {rss:.0f} MB")
 def timeit(label, params, reps=5):
     ts = []
     for _ in range(reps):
@@ -96,8 +100,8 @@ t = time.perf_counter(); big.related("%040x" % 5); print(f"  related{'':<37} {(t
 # writing while compacting and the cost of persisting an event
 t = time.perf_counter()
 for i in range(2000): big.update_health("%040x" % i, 5, 2, "scrape")
-print(f"  2000 health events to the journal{'':<10} {(time.perf_counter() - t) * 1000:7.1f} ms  ({(time.perf_counter() - t) * 1000 / 2000:.3f} ms/event; previously: rewriting the whole file)")
-t = time.perf_counter(); big.compact_journal(); print(f"  compact the whole journal{'':<19} {(time.perf_counter() - t):7.1f} s  (without blocking writes)")
+print(f"  2000 health events (slot + WAL){'':<12} {(time.perf_counter() - t) * 1000:7.1f} ms  ({(time.perf_counter() - t) * 1000 / 2000:.3f} ms/event)")
+t = time.perf_counter(); big.checkpoint(); print(f"  checkpoint (state.bin){'':<22} {(time.perf_counter() - t):7.2f} s  (without blocking writes)")
 big.close()
 assert worst < 900, f"search too slow: {worst:.0f} ms"
 print("performance: OK")
