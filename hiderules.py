@@ -20,6 +20,8 @@ import threading
 import time
 import uuid
 
+import regex
+
 from jsonio import atomic_write, load_json
 from textutil import norm, tokenize
 
@@ -27,6 +29,11 @@ SCOPES = ("all", "name", "files")
 MODES = ("word", "substring", "regex")
 MAX_TERM = 200
 MAX_RULES = 500
+# Admin regexes run against every indexed name/path: bound each search so a catastrophic pattern
+# (ReDoS, e.g. "(a+)+$") cannot stall the server. regex is re-compatible but supports a timeout.
+RX_TIMEOUT = 0.05
+RX_PROBE_TIMEOUT = 0.25
+_RX_PROBES = tuple(c * 5000 + "!" for c in ("a", "1", " ", ".", "-")) + ("ab" * 2500 + "!",)
 
 
 class RuleError(ValueError):
@@ -49,22 +56,28 @@ def validate(term, scope, mode):
         raise RuleError("Empty term")
     if mode == "regex":
         try:
-            rx = re.compile(term, re.I)
-        except re.error as e:
+            rx = regex.compile(term, regex.I)
+        except regex.error as e:
             raise RuleError(f"Invalid regular expression: {e}")
         if rx.search(""):
             raise RuleError("The regular expression matches the empty text (it would hide everything)")
+        try:
+            for probe in _RX_PROBES:
+                rx.search(probe, timeout=RX_PROBE_TIMEOUT)
+        except TimeoutError:
+            raise RuleError("The regular expression is too slow (catastrophic backtracking): simplify it")
     return term
 
 
 class Matcher:
     """Compiled version of a rule. test(original_text, normalized_text, normalized_tokens) -> bool"""
-    __slots__ = ("id", "scope", "mode", "needle", "rx", "tokens")
+    __slots__ = ("id", "scope", "mode", "needle", "rx", "tokens", "slow")
 
     def __init__(self, rule):
         self.id, self.scope, self.mode = rule["id"], rule["scope"], rule["mode"]
         self.rx = None
         self.tokens = []
+        self.slow = False
         if self.mode == "word":
             self.tokens = tokenize(rule["term"])
             self.needle = " " + " ".join(self.tokens) + " "
@@ -72,20 +85,32 @@ class Matcher:
             self.needle = norm(rule["term"]).strip()
         else:
             self.needle = None
-            self.rx = re.compile(rule["term"], re.I)
+            self.rx = regex.compile(rule["term"], regex.I)
 
     def test(self, raw, n, toks):
         if self.mode == "word":
             return self.needle in toks
         if self.mode == "substring":
             return self.needle in n
-        return bool(self.rx.search(raw) or self.rx.search(n))
+        if self.slow:                                       # timed out once: stop running it
+            return False
+        try:
+            return bool(self.rx.search(raw, timeout=RX_TIMEOUT) or self.rx.search(n, timeout=RX_TIMEOUT))
+        except TimeoutError:
+            self.slow = True
+            print(f"[hiderules] rule {self.id}: regex timed out, disabled until it is edited")
+            return False
 
     def spans(self, raw):
         """Spans [a, b) of the ORIGINAL text that match (for highlighting in the panel)."""
         from textutil import norm_map
         if self.mode == "regex":
-            return [(m.start(), m.end()) for m in self.rx.finditer(raw) if m.end() > m.start()][:20]
+            if self.slow:
+                return []
+            try:
+                return [(m.start(), m.end()) for m in self.rx.finditer(raw, timeout=RX_TIMEOUT) if m.end() > m.start()][:20]
+            except TimeoutError:
+                return []
         n, mp = norm_map(raw)
         out = []
         if self.mode == "substring":
