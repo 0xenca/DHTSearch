@@ -18,7 +18,7 @@ from datetime import timedelta
 
 from flask import Blueprint, jsonify, request, session
 
-from hiderules import MODES, SCOPES, Matcher, RuleError, validate
+from hiderules import MODES, SCOPES, Matcher, check
 from peers import parse_ip_specs
 from records import health_state
 from textutil import magnet_of
@@ -206,19 +206,19 @@ def rules_list():
 
 
 def _rule_input():
+    """(term, scope, mode, note, problem): problem is the message for the admin when the rule is invalid."""
     b = request.get_json(silent=True) or {}
     scope = b.get("scope") or "all"
     mode = b.get("mode") or "word"
-    term = validate(b.get("term"), scope, mode)
-    return term, scope, mode, str(b.get("note") or "")
+    term, problem = check(b.get("term"), scope, mode)
+    return term, scope, mode, str(b.get("note") or ""), problem
 
 
 @bp.post("/rules/preview")
 def rules_preview():
-    try:
-        term, scope, mode, _ = _rule_input()
-    except RuleError as e:
-        return jsonify({"error": str(e)}), 400
+    term, scope, mode, _, problem = _rule_input()
+    if problem:
+        return jsonify({"error": problem}), 400
     m = Matcher({"id": "preview", "term": term, "scope": scope, "mode": mode})
     return jsonify(_store().preview_rule(m))
 
@@ -226,11 +226,11 @@ def rules_preview():
 @bp.post("/rules")
 def rules_add():
     st = _store()
-    try:
-        term, scope, mode, note = _rule_input()
-        rule = st.rules.add(term, scope, mode, note)
-    except RuleError as e:
-        return jsonify({"error": str(e)}), 400
+    term, scope, mode, note, problem = _rule_input()
+    if not problem:
+        rule, problem = st.rules.try_add(term, scope, mode, note)
+    if problem:
+        return jsonify({"error": problem}), 400
     res = st.recompute_hidden()
     rule["count"] = _rule_counts(st).get(rule["id"], 0)
     return jsonify({"rule": rule, **res})
