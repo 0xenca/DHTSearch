@@ -9,6 +9,7 @@ Requests that change anything require JSON (a form on another site cannot send i
 import hashlib
 import hmac
 import ipaddress
+import logging
 import os
 import threading
 import time
@@ -22,6 +23,7 @@ from peers import parse_ip_specs
 from records import health_state
 from textutil import magnet_of
 
+log = logging.getLogger("admin")
 bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 _CFG = {"store": None, "pwd": "admin", "pwd_tag": ""}
 _FAILS = {}
@@ -406,10 +408,15 @@ def ai_status():
 
 @bp.post("/ai/config")
 def ai_config():
+    ai, changes = _ai(), request.get_json(silent=True) or {}
+    _, problem = ai.check(changes)
+    if problem:
+        return jsonify({"error": problem}), 400
     try:
-        cfg = _ai().update(request.get_json(silent=True) or {})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        cfg = ai.update(changes)
+    except ValueError:                                      # config changed meanwhile: check() vs update()
+        log.warning("AI config update rejected", exc_info=True)
+        return jsonify({"error": "invalid AI settings, try again"}), 400
     return jsonify({"ok": True, "config": cfg, **_store().ai_counts()})
 
 
@@ -418,10 +425,9 @@ def ai_test():
     """Classifies a text or an indexed torrent NOW with the settings in the form (without saving them)."""
     ai, st = _ai(), _store()
     b = request.get_json(silent=True) or {}
-    try:
-        cfg = ai.validated(b.get("config") or {})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    cfg, problem = ai.check(b.get("config") or {})
+    if problem:
+        return jsonify({"error": problem}), 400
     text = str(b.get("text") or "").strip()[:900]
     ih = str(b.get("ih") or "").strip().lower()
     if ih:
@@ -436,10 +442,19 @@ def ai_test():
     from aimod import ModelError, ModelUnreachable
     try:
         r = ai.classify(text, cfg)
-    except (ModelUnreachable, ModelError) as e:
-        return jsonify({"error": str(e)}), 502
-    except (ValueError, KeyError, TypeError) as e:
-        return jsonify({"error": f"the model at {cfg['endpoint']} answered something unexpected: {e}"}), 502
+    # Exception details (URLs, model output, internals) go to the server log, not to the browser.
+    except ModelUnreachable as e:
+        log.warning("AI test: %s", e)
+        return jsonify({"error": f"cannot reach the model at {cfg['endpoint']} (refused, DNS or no answer within "
+                                 f"{cfg['timeout']} s): check the endpoint and the timeout. Details in the server log."}), 502
+    except ModelError as e:
+        log.warning("AI test: %s", e)
+        return jsonify({"error": f"the model at {cfg['endpoint']} answered with an error (HTTP error, not JSON, or "
+                                 "missing model name). Details in the server log."}), 502
+    except (ValueError, KeyError, TypeError):
+        log.warning("AI test: unexpected model answer", exc_info=True)
+        return jsonify({"error": f"the model at {cfg['endpoint']} answered something unexpected. "
+                                 "Details in the server log."}), 502
     score = int(round(r["score"] * 100))
     hides = score >= cfg["threshold"] and bool(set(r["cats"]) & set(cfg["act_on"]))
     return jsonify({"text": text, "score": score, "cats": r["cats"], "label": r["label"], "logprobs": r["logprobs"], "api": r.get("api"),
