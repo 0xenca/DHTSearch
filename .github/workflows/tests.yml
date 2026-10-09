@@ -1,0 +1,59 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies (libtorrent is not needed by the tests)
+        run: |
+          grep -v '^libtorrent' requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+      - name: Run tests
+        run: |
+          set -e
+          for t in tests/test_*.py; do
+            # Timing-based and ~4 min long: runs in the "performance" job on main only.
+            [ "$t" = tests/test_migration_perf.py ] && continue
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
+  performance:
+    name: Migration performance
+    # Shared runners have noisy timings: keep this out of PRs, run it on main (and by hand).
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies (libtorrent is not needed by the tests)
+        run: |
+          grep -v '^libtorrent' requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+      - name: Run migration performance test
+        run: python tests/test_migration_perf.py
