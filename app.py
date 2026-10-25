@@ -202,6 +202,8 @@ def main():
     from aimod import AIModerator
     ai = STATE["ai"] = AIModerator(store, data_dir)
     admin.init(app, lambda: STATE["store"], args.admin_password, data_dir, lambda: STATE.get("crawler"), lambda: STATE.get("ai"))
+    import debugmem
+    debugmem.init(app, STATE)                      # /api/debug/*: memory diagnostics (admin session or debug token)
     if args.admin_password == "admin":
         logging.warning("admin panel with the DEFAULT password (\"admin\"). Change it with --admin-password "
                         "or TS_ADMIN_PASSWORD%s", " — and you are listening on " + args.host + "!" if args.host not in ("127.0.0.1", "localhost", "::1") else "")

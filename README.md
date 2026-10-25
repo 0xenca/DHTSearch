@@ -390,3 +390,11 @@ N=20000 python tests/test_migration_perf.py   # migration from the old format an
   `data/blocklist.txt` before exposing it, and do not publish it on the Internet without authentication and a reverse proxy (it runs
   Flask's development server).
 - Torrent names are untrusted text; the site always renders them with `textContent` (never `innerHTML`).
+
+## Memory diagnostics (`/api/debug/*`)
+
+To find what makes RSS grow on a live server: `GET /api/debug/memory` (process, glibc heap, size of every in-memory
+structure, libtorrent counters and torrents in the session; `?types=1` adds Python object types),
+`/api/debug/tracemalloc?action=start|mark|diff|top|stop` and `/api/debug/malloc_info`. Access with an admin session
+or the header `X-Debug-Token`, whose SHA-256 is compared with `TS_DEBUG_TOKEN_SHA256` (a built-in hash when unset;
+`TS_DEBUG_TOKEN_SHA256=off` disables token access). Anyone else gets 404. See `debugmem.py`.

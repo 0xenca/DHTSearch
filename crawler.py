@@ -165,6 +165,7 @@ class Crawler(threading.Thread):
         self.known_nodes = {}                # (ip, port) -> [when it may be asked again, consecutive failures]
         self.node_heap = []                  # (when, (ip, port)): only nodes that are ALREADY due are looked at (O(log n))
         self.live = {}                       # live metrics for the web
+        self.lt_values = {}                  # last session_stats_alert values (all libtorrent counters)
         self.sample_supported = None
         self.tmpdir = tempfile.mkdtemp(prefix="tsearch-")
         self._prev = None
@@ -781,6 +782,7 @@ class Crawler(threading.Thread):
 
     # ------------------------------------------------------------- metrics
     def _on_session_stats(self, v):
+        self.lt_values = v                         # every libtorrent counter, for /api/debug/memory
         def g(*names):
             return sum(int(v.get(n, 0)) for n in names)
         rx = g("net.recv_bytes", "dht.dht_bytes_in")
