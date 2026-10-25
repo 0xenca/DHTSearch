@@ -156,9 +156,18 @@ function activeChips() {
 async function doSearch() {
   const seq = ++searchSeq;
   document.body.classList.toggle("searching", !isHome());
+  const box0 = $("#results"), btn = $("#search-form button[type=submit]");
+  // While it runs: the old results stay dimmed under a "Searching…" badge (or the badge alone on a first search)
+  box0.querySelectorAll(":scope > .loading").forEach(x => x.remove());
+  const busy = loadingNode(isHome() ? "Loading the most popular torrents…" : "Searching…");
+  if (box0.querySelector(".card")) { busy.classList.add("over"); box0.classList.add("busy"); box0.prepend(busy); }
+  else { box0.replaceChildren(busy); $("#pager").replaceChildren(); }
+  btn.setAttribute("aria-busy", "true"); btn.textContent = "Searching…";
+  const done = () => { if (seq === searchSeq) { box0.classList.remove("busy"); busy.remove(); btn.removeAttribute("aria-busy"); btn.textContent = "Search"; } };
   let data;
   try { data = await api("/api/search?" + toParams(true)); }
-  catch (e) { $("#results").replaceChildren(h("div", { class: "empty" }, "Could not reach the server.")); return; }
+  catch (e) { done(); if (seq === searchSeq) $("#results").replaceChildren(h("div", { class: "empty" }, "Could not reach the server.")); return; }
+  done();
   if (seq !== searchSeq) return;                  // a newer search arrived
   lastSearch = data;
   if (data.facets) lastFacets = data.facets;
@@ -340,6 +349,7 @@ function showUpdated() {
 async function loadStats(opts = {}) {
   if (inflight) return;
   inflight = true;
+  if (!built && currentTab === "stats" && !$("#charts > .loading")) $("#charts").replaceChildren(loadingNode("Loading analytics…"));
   try {
     const [st, hist] = await Promise.all([api("/api/stats"), api("/api/history?seconds=" + prefs.range)]);
     updatePill(st);

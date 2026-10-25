@@ -2,10 +2,19 @@
    MINOR = feature or behaviour change · PATCH = fixes · MAJOR = incompatible data format.
 The web shows it in the header and in Analytics; /api/version and /api/stats return it."""
 
-__version__ = "4.3.0"
+__version__ = "4.4.1"
 
 # (version, date, summary) — newest first
 CHANGELOG = [
+    ("4.4.1", "2026-10-25", "Memory diagnostics of the running service at /api/debug/* (admin session or debug token; 404 "
+                            "otherwise): process and glibc heap figures, size of every in-memory structure, libtorrent "
+                            "counters and torrents in the session, Python object types, tracemalloc start/diff, malloc_info."),
+    ("4.4.0", "2026-10-25", "Less RAM, and RSS no longer only grows: glibc is set to return freed memory (fixed mmap threshold, "
+                            "2 arenas, lower trim threshold; trimmed every 10 min), one BLAS thread, a 4x smaller in-RAM index "
+                            "delta (250 K postings, ~25 MB) and smaller libtorrent peer lists per probe. Fix: autocomplete and "
+                            "\"did you mean\" could fail with \"dictionary changed size during iteration\" while torrents were "
+                            "being indexed. Web: a progress bar while anything loads and \"Searching…\" / \"Loading…\" "
+                            "indicators (results dimmed while a new search runs, a note when it takes long)."),
     ("4.3.0", "2026-10-04", "AI moderation speaks Ollama's native API (/api/generate, raw prompt, logprobs): real confidence "
                             "percentages with Ollama (0.12+) instead of 0/50/100 %, and no double prompt template. Auto-detected "
                             "(GET /api/version) or chosen in \"Server API\"."),

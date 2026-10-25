@@ -165,6 +165,7 @@ class Crawler(threading.Thread):
         self.known_nodes = {}                # (ip, port) -> [when it may be asked again, consecutive failures]
         self.node_heap = []                  # (when, (ip, port)): only nodes that are ALREADY due are looked at (O(log n))
         self.live = {}                       # live metrics for the web
+        self.lt_values = {}                  # last session_stats_alert values (all libtorrent counters)
         self.sample_supported = None
         self.tmpdir = tempfile.mkdtemp(prefix="tsearch-")
         self._prev = None
@@ -224,6 +225,12 @@ class Crawler(threading.Thread):
             # 3 MB by default: torrents with tens of thousands of files could NEVER be fetched (and the attempt was
             # repeated up to 3 times). Does not change the load: it just stops throwing away already-downloaded metadata.
             "max_metadata_size": 32 * 1024 * 1024,
+            # Memory (libtorrent's own, outside Python): a probe lives ~45 s and only needs a few peers that answer, not
+            # libtorrent's 3,000 remembered candidates per torrent (x150 probes), and nothing is ever written to disk, so
+            # the disk I/O threads stay idle (each one has its own stack and buffers).
+            "max_peerlist_size": 500,
+            "max_paused_peerlist_size": 100,
+            "aio_threads": 2,
         }
         try:
             known = set(lt.default_settings())
@@ -775,6 +782,7 @@ class Crawler(threading.Thread):
 
     # ------------------------------------------------------------- metrics
     def _on_session_stats(self, v):
+        self.lt_values = v                         # every libtorrent counter, for /api/debug/memory
         def g(*names):
             return sum(int(v.get(n, 0)) for n in names)
         rx = g("net.recv_bytes", "dht.dht_bytes_in")

@@ -243,8 +243,21 @@ In `/api/stats` → `live`: `incoming_connections` (if it stays at 0, the port i
 
 RAM holds only fixed-size columns per torrent (size, seeders, dates, category, flags, an extension bitmask, offsets):
 ~100 B per torrent plus the infohash table (~16 B). Names, file lists, history, breakdowns and the search index live on
-disk and are read on demand (pread/mmap). The index keeps a bounded in-RAM delta (1 M postings) that is written as a
-segment when full. Nothing in RAM grows with the number of files or measurements.
+disk and are read on demand (pread/mmap). The index keeps a bounded in-RAM delta (250 K postings, ~25 MB) that is written
+as a segment when full. Nothing in RAM grows with the number of files or measurements.
+
+**RSS that keeps growing** was mostly glibc keeping freed memory: search, analytics and the refresh scheduler allocate
+temporary arrays of a few MB over every torrent many times a minute, and glibc's default *dynamic* mmap threshold ends up
+serving them from fragmented heap arenas that are never returned. Since 4.4 `app.py` fixes it at startup (mmap threshold
+256 KB, 2 arenas, trim threshold 8 MB; `malloc_trim` every 10 min) and runs numpy with one BLAS thread. Your own
+`MALLOC_ARENA_MAX` / `MALLOC_MMAP_THRESHOLD_` / `MALLOC_TRIM_THRESHOLD_` in the unit take precedence; the startup log
+prints what was applied (`malloc tuning: …`). libtorrent's share is bounded with `max_peerlist_size` 500 per probe.
+The biggest remaining knobs are `--max-probes` (each probe is a libtorrent torrent with its peers and connections) and
+`--peer-max` (≈ 40 B per entry).
+
+Searches trade speed for memory and disk (nothing is cached in RAM beyond ~20 s for the front page), so the web shows a
+progress bar along the top while anything loads, and "Searching…" / "Loading…" placeholders (the previous results stay
+dimmed while a new search runs, with a note if it takes more than a few seconds).
 
 Writes are sequential and written once: metadata appended to `meta.log`, index segments written once and merged by tiers,
 one 4 KiB page per health measurement, a daily checkpoint. The SQLite file index of 3.1 (≈ 2 MB written per indexed
@@ -377,3 +390,11 @@ N=20000 python tests/test_migration_perf.py   # migration from the old format an
   `data/blocklist.txt` before exposing it, and do not publish it on the Internet without authentication and a reverse proxy (it runs
   Flask's development server).
 - Torrent names are untrusted text; the site always renders them with `textContent` (never `innerHTML`).
+
+## Memory diagnostics (`/api/debug/*`)
+
+To find what makes RSS grow on a live server: `GET /api/debug/memory` (process, glibc heap, size of every in-memory
+structure, libtorrent counters and torrents in the session; `?types=1` adds Python object types),
+`/api/debug/tracemalloc?action=start|mark|diff|top|stop` and `/api/debug/malloc_info`. Access with an admin session
+or the header `X-Debug-Token`, whose SHA-256 is compared with `TS_DEBUG_TOKEN_SHA256` (a built-in hash when unset;
+`TS_DEBUG_TOKEN_SHA256=off` disables token access). Anyone else gets 404. See `debugmem.py`.

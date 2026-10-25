@@ -409,3 +409,17 @@ table.data tr.sep td { border-top: 2px solid var(--line); }
 .ai-bulk { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .ai-card h3 { display: flex; align-items: baseline; gap: 6px; }
 @media (max-width: 600px) { .ai-form { grid-template-columns: 1fr; } }
+
+/* ---- loading feedback (common.js: loadbar / loadingNode) ---- */
+#loadbar { position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 1000; overflow: hidden; background: color-mix(in srgb, var(--accent) 18%, transparent); }
+#loadbar::before { content: ""; position: absolute; top: 0; bottom: 0; width: 35%; background: var(--accent); animation: loadbar 1.1s ease-in-out infinite; }
+@keyframes loadbar { from { left: -35%; } to { left: 100%; } }
+.loading { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px 10px; color: var(--ink-2); padding: 36px 0; text-align: center; }
+.loading > .small { flex-basis: 100%; }
+.loading.inline { padding: 8px 0; justify-content: flex-start; }
+.spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#results.busy > .card { opacity: .45; transition: opacity .15s; pointer-events: none; }
+#results .loading.over { position: sticky; top: 8px; z-index: 2; padding: 8px 14px; margin: 0 auto; background: var(--surface); border: 1px solid var(--line); border-radius: 99px; box-shadow: var(--shadow); }
+.searchbar button[aria-busy="true"] { opacity: .8; cursor: progress; }
+@media (prefers-reduced-motion: reduce) { #loadbar::before, .spinner { animation-duration: 3s; } }
