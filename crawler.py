@@ -224,6 +224,12 @@ class Crawler(threading.Thread):
             # 3 MB by default: torrents with tens of thousands of files could NEVER be fetched (and the attempt was
             # repeated up to 3 times). Does not change the load: it just stops throwing away already-downloaded metadata.
             "max_metadata_size": 32 * 1024 * 1024,
+            # Memory (libtorrent's own, outside Python): a probe lives ~45 s and only needs a few peers that answer, not
+            # libtorrent's 3,000 remembered candidates per torrent (x150 probes), and nothing is ever written to disk, so
+            # the disk I/O threads stay idle (each one has its own stack and buffers).
+            "max_peerlist_size": 500,
+            "max_paused_peerlist_size": 100,
+            "aio_threads": 2,
         }
         try:
             known = set(lt.default_settings())

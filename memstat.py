@@ -81,6 +81,38 @@ def process_memory():
     return out
 
 
+def tune_malloc():
+    """Keeps glibc from holding on to freed memory (call it before the threads and numpy start).
+
+    The search, the analytics and the refresh scheduler allocate temporary numpy arrays of a few MB over all the torrents
+    many times a minute. By default glibc serves big blocks with mmap and returns them on free, BUT the first time one is
+    freed it raises its mmap threshold (up to 32 MB): from then on those arrays come from the heap arenas, freed blocks get
+    fragmented between long-lived objects and RSS only grows (GBs over days). A FIXED threshold disables that adjustment;
+    fewer arenas and a lower trim threshold give the rest back sooner. Values already set in the environment
+    (MALLOC_ARENA_MAX, MALLOC_MMAP_THRESHOLD_, MALLOC_TRIM_THRESHOLD_) win. Returns what was applied."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        return {}
+    applied = {}
+    for env, param, value in (("MALLOC_ARENA_MAX", -8, 2), ("MALLOC_MMAP_THRESHOLD_", -3, 256 << 10),
+                              ("MALLOC_TRIM_THRESHOLD_", -1, 8 << 20)):
+        if env not in os.environ and libc.mallopt(param, value) == 1:
+            applied[env] = value
+    return applied
+
+
+def trim():
+    """Returns free heap memory to the system (glibc does not do it by itself after peaks)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 def drop_cache(path_or_fd):
     """Asks the kernel to drop the (clean) page cache of a file the service has just read or written in bulk (journal at
     startup, compaction, building the file-name index). Only a hint: the data stays on disk and is read again if needed."""

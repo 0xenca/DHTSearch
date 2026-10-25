@@ -58,10 +58,33 @@ function fmtRel(t) {                       // "5 min ago"
   return fmtDate(t);
 }
 
-async function api(path) {
-  const r = await fetch(path);
-  if (!r.ok) { const e = new Error(path + " → " + r.status); e.status = r.status; throw e; }
-  return r.json();
+/* ---------- loading feedback ----------
+   Every request goes through api(): while any is pending for more than a moment, a thin bar runs along the top of
+   the page (the server trades speed for low RAM/disk, so some answers take a while). */
+let apiPending = 0, loadbarTimer = null;
+function loadbar(on) {
+  let bar = document.getElementById("loadbar");
+  if (!bar) { bar = h("div", { id: "loadbar", role: "progressbar", "aria-label": "Loading", hidden: true }); document.body.prepend(bar); }
+  clearTimeout(loadbarTimer);
+  if (on) loadbarTimer = setTimeout(() => { bar.hidden = false; }, 150);   // fast answers do not flash it
+  else bar.hidden = true;
+}
+async function api(path, opts) {
+  if (apiPending++ === 0) loadbar(true);
+  try {
+    const r = await fetch(path, opts);
+    if (!r.ok) { const e = new Error(path + " → " + r.status); e.status = r.status; throw e; }
+    return await r.json();
+  } finally {
+    if (--apiPending === 0) loadbar(false);
+  }
+}
+// "⟳ Searching…" placeholder: spinner + text; after `slowMs` it adds a note that it is still working
+function loadingNode(text, slowMs = 4000, slowText = "Still working — large queries can take a few seconds on this server…") {
+  const note = h("div", { class: "muted small", hidden: true }, slowText);
+  const el = h("div", { class: "loading", role: "status", "aria-live": "polite" }, h("span", { class: "spinner", "aria-hidden": "true" }), h("span", null, text), note);
+  setTimeout(() => { note.hidden = false; }, slowMs);    // harmless if the placeholder is already gone
+  return el;
 }
 const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
                 set(k, v) { try { localStorage.setItem(k, v); } catch {} } };

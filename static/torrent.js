@@ -6,6 +6,7 @@ const main = $("#tmain");
 
 (async function init() {
   let t;
+  main.replaceChildren(loadingNode("Loading torrent…"));
   try { t = await api("/api/torrent/" + IH); }
   catch (e) { return renderMissing(e.status === 404); }
   document.title = t.name + " · DHT Search";
@@ -67,7 +68,7 @@ function render(t) {
       card("Information", infoBlock(t)),
       card("Who reports what", sourcesBlock(t, isAdmin), "wide"),
       card("File types", compositionBlock(t)),
-      h("div", { id: "related-slot", class: "tcard" }, h("h2", null, "Similar torrents"), h("div", { class: "muted" }, "Searching…")),
+      h("div", { id: "related-slot", class: "tcard" }, h("h2", null, "Similar torrents"), loadingNode("Looking for similar torrents…")),
       card("Files", filesBlock(files, t), "wide"),
       isAdmin ? card("Known peers (admin only)", peerTable(t.peers_known, ip => { location.href = "/#admin"; sessionStorage.setItem("admSearchIp", ip); }), "wide") : null)].filter(Boolean));
   if (hiddenBanner)                                      // rule names (the page does not know them)

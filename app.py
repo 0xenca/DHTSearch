@@ -10,12 +10,19 @@ import sys
 import threading
 import time
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+import memstat
+# Before numpy / libtorrent / the threads start: one BLAS thread (each extra one reserves its own buffers and the
+# search never multiplies matrices) and a malloc that gives freed memory back (see memstat.tune_malloc).
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+MALLOC_TUNING = memstat.tune_malloc()
 
-import admin
-from version import VERSION_DATE, __version__, info as version_info
-from memstat import process_memory
-from store import Store
+from flask import Flask, abort, jsonify, request, send_from_directory  # noqa: E402
+
+import admin  # noqa: E402
+from version import VERSION_DATE, __version__, info as version_info  # noqa: E402
+from memstat import process_memory  # noqa: E402
+from store import Store  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, static_folder=os.path.join(ROOT, "static"), static_url_path="/static")
@@ -125,11 +132,7 @@ def _rss_mb():
 def trim_memory():
     """Returns free heap memory to the system (glibc does not do it by itself after peaks such as loading the journal
     or a compaction). Does not touch disk or data."""
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+    memstat.trim()
 
 
 def _flusher(store, stop):
@@ -140,8 +143,8 @@ def _flusher(store, stop):
             store.flush()
             if ticks % 40 == 0:                     # every ~10 min
                 res = store.maintenance()
+                trim_memory()                       # every ~10 min: cheap, and RSS no longer only goes up
                 if res["failed_purged"] or res.get("checkpoint") or res.get("peers_expired") or res.get("peers_capped"):
-                    trim_memory()
                     m = process_memory()
                     logging.info("maintenance: %s (RSS %s MB: program %s MB; cgroup %s MB of which page cache %s MB)", res,
                                  m.get("rss_mb"), m.get("rss_anon_mb"), (m.get("cgroup") or {}).get("total_mb"),
@@ -183,6 +186,8 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    if MALLOC_TUNING:
+        logging.info("malloc tuning: %s", MALLOC_TUNING)
 
     if args.selftest:
         from crawler import selftest

@@ -1,7 +1,7 @@
 """
 Inverted index on disk, built like a search engine (log-structured): token -> sorted document ids.
 
-  * New documents go to a small in-memory DELTA (bounded: ~1 M postings).
+  * New documents go to a small in-memory DELTA (bounded: 250 K postings, ~25 MB).
   * When the delta is full it is written as an immutable SEGMENT: a few files written ONCE, sequentially.
   * Segments are merged in the background by tiers (8 similar-sized segments -> 1): every posting is rewritten only
     ~log8(total / delta) times in its whole life, always sequentially. No random in-place updates (that is what made
@@ -33,7 +33,7 @@ log = logging.getLogger("index")
 
 FENCE = 256
 MERGE_FACTOR = 8
-FLUSH_POSTINGS = 1_000_000
+FLUSH_POSTINGS = 250_000          # in-RAM delta written as a segment when full (~25 MB of RAM; 1 M was ~100 MB)
 _EMPTY = np.zeros(0, np.uint32)
 _EXTS = ("blob", "toff", "poff", "post", "json")
 
@@ -414,6 +414,17 @@ class SegIndex:
             fr = self.frozen
             return list(self.segs), (fr[0] if fr else None), self.delta
 
+    def _delta_items(self, frozen, delta, prefix):
+        """(key, postings) of the in-memory deltas whose key starts with prefix. The live delta is copied under the lock:
+        the indexer adds keys to it concurrently (iterating it directly raised "dictionary changed size")."""
+        out = []
+        for dl in (frozen, delta):
+            if dl:
+                with self.lock:
+                    items = list(dl.items())
+                out += [(k, a) for k, a in items if k.startswith(prefix)]
+        return out
+
     def postings(self, key):
         """Sorted document ids that contain key (numpy uint32)."""
         segs, frozen, delta = self._snapshot()
@@ -458,11 +469,8 @@ class SegIndex:
                 if npost >= max_postings:
                     break
             ntok += b - a
-        for dl in (frozen, delta):
-            if dl:
-                for k, a in dl.items():
-                    if k.startswith(prefix):
-                        parts.append(np.frombuffer(a.tobytes(), np.uint32))
+        for k, a in self._delta_items(frozen, delta, prefix):
+            parts.append(np.frombuffer(a.tobytes(), np.uint32))
         if not parts:
             return _EMPTY
         return np.unique(np.concatenate(parts))
@@ -476,11 +484,8 @@ class SegIndex:
             for i in range(a, min(b, a + limit)):
                 k = bytes(s.tok(i))
                 out[k] = out.get(k, 0) + s.count_at(i)
-        for dl in (frozen, delta):
-            if dl:
-                for k, a in dl.items():
-                    if k.startswith(prefix):
-                        out[k] = out.get(k, 0) + len(a)
+        for k, a in self._delta_items(frozen, delta, prefix):
+            out[k] = out.get(k, 0) + len(a)
         return out
 
     def stats(self):

@@ -8,9 +8,12 @@
   async function req(method, path, body) {
     const opts = { method, credentials: "same-origin", headers: {} };
     if (method !== "GET") { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body || {}); }
-    const r = await fetch(path, opts);
-    let data = null;
-    try { data = await r.json(); } catch {}
+    if (apiPending++ === 0) loadbar(true);                // same top progress bar as api() (common.js)
+    let r, data = null;
+    try {
+      r = await fetch(path, opts);
+      try { data = await r.json(); } catch {}
+    } finally { if (--apiPending === 0) loadbar(false); }
     if (!r.ok) {
       if (r.status === 401 && path !== "/api/admin/login") lock();
       const e = new Error((data && data.error) || ("Error " + r.status)); e.status = r.status; e.data = data; throw e;
