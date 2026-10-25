@@ -1,0 +1,3 @@
+# Shell scripts and units must keep LF line endings, also in Windows checkouts (CRLF breaks bash: "set: pipefail: invalid option name")
+*.sh text eol=lf
+*.service text eol=lf

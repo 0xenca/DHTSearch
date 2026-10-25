@@ -14,6 +14,10 @@
 # password outside the unit (/etc/torrent-search/env, mode 600), opens the firewall if one is active, runs the
 # libtorrent self-test, starts the service and prints the addresses where it answers.
 # Run it again to update: the current settings become the defaults and the data is kept (backup offered first).
+# Saved with Windows line endings (CRLF: copied through Windows, or a git checkout with core.autocrlf)? bash would stop
+# with "set: pipefail: invalid option name". Convert this file to LF once and start again. The trailing "#" keeps this
+# line working while it still ends in a CR.
+if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then echo "install.sh: converting Windows line endings (CRLF) to LF…"; sed -i 's/\r$//' "${BASH_SOURCE[0]}"; exec bash "${BASH_SOURCE[0]}" "$@"; fi #
 set -euo pipefail
 
 SERVICE=torrent-search
