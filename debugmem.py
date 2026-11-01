@@ -143,8 +143,8 @@ def structures(st, cr, ai):
         if ses is not None:
             try:
                 c["lt_torrents_in_session"] = len(ses.get_torrents())     # > jobs = torrents never removed
-            except Exception as e:
-                c["lt_torrents_in_session"] = f"error: {e}"
+            except Exception:
+                c["lt_torrents_in_session"] = "error"
         lv = getattr(cr, "lt_values", None) or {}
         keys = ("ses.num_", "peer.num_", "disk.", "dht.dht_", "net.has_", "sock_bufs.", "picker.")
         c["lt_counters"] = {k: v for k, v in sorted(lv.items()) if v and k.startswith(keys)}
@@ -176,8 +176,8 @@ def memory():
                                   baseline_age_s=int(t0 - _TM["base_at"]) if _TM["base"] else None)
     try:
         out["structures"] = structures(S.get("store"), S.get("crawler"), S.get("ai"))
-    except Exception as e:                                  # never let a diagnostic break on a race
-        out["structures_error"] = f"{type(e).__name__}: {e}"
+    except Exception:                                  # never let a diagnostic break on a race
+        out["structures_error"] = "internal_error"
     if request.args.get("types") == "1":
         cnt = Counter(type(o).__name__ for o in gc.get_objects())
         out["python"]["top_types"] = cnt.most_common(40)
